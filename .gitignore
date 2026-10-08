@@ -1,0 +1,17 @@
+build/
+.DS_Store
+dist/
+mockups/
+PROGRESS.md
+
+# AI coding-agent files (local only)
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.cursor/
+.cursorrules
+.windsurfrules
+.aider*
+.mcp.json
+.github/copilot-instructions.md

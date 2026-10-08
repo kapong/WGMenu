@@ -1,0 +1,105 @@
+#!/bin/bash
+# wgctl — privileged helper for WGMenu. Installed root:wheel 755 at /usr/local/sbin/wgctl.
+# Usage: wgctl list | status | up NAME | down NAME
+# Bash 3.2 compatible (macOS /bin/bash).
+set -euo pipefail
+# Runs as root via NOPASSWD sudo, so everything it executes must be root-owned.
+# wg-quick, wg, wireguard-go and bash (+ its dylibs) are root-owned copies made by
+# wgmenu-setup; nothing under /opt/homebrew (user-writable) is ever executed.
+LIBEXEC=/usr/local/libexec/wgmenu
+SAFE_PATH="$LIBEXEC:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$SAFE_PATH"
+
+CONF_DIR=/etc/wireguard
+RUN_DIR=/var/run/wireguard
+NAME_RE='^[a-zA-Z0-9_=+.-]{1,15}$'
+
+die() { echo "wgctl: $*" >&2; exit 1; }
+
+# Refuse unless path $1 is root-owned, not a symlink and not group/other-writable.
+check_root_owned() {
+  local uid mode
+  [ -e "$1" ] || die "missing $1 (run: sudo wgmenu-setup)"
+  [ ! -L "$1" ] || die "refusing: $1 is a symlink (run: sudo wgmenu-setup)"
+  read -r uid mode <<< "$(/usr/bin/stat -f '%u %Lp' "$1")"
+  [ "$uid" = 0 ] || die "refusing: $1 is not owned by root (run: sudo wgmenu-setup)"
+  [ $((0$mode & 022)) -eq 0 ] || die "refusing: $1 is group/other-writable (run: sudo wgmenu-setup)"
+}
+
+# Verify $LIBEXEC, every file in it, and every ancestor directory below / (SIP-protected).
+check_libexec() {
+  local f p
+  for f in bash wg-quick wg wireguard-go; do [ -x "$LIBEXEC/$f" ] || die "missing $LIBEXEC/$f (run: sudo wgmenu-setup)"; done
+  shopt -s nullglob
+  for f in "$LIBEXEC"/* "$LIBEXEC"/lib/*; do check_root_owned "$f"; done
+  shopt -u nullglob
+  p=$LIBEXEC
+  while [ "$p" != / ]; do check_root_owned "$p"; p=$(/usr/bin/dirname "$p"); done
+}
+
+[ "$(id -u)" -eq 0 ] || die "must run as root (sudo)"
+check_libexec
+
+# Children get an empty environment plus a fixed PATH (sudo env_reset already
+# whitelists; this also drops WG_*, BASH_ENV, LOG_LEVEL, etc. if sudoers changes).
+run_clean() {
+  /usr/bin/env -i PATH="$SAFE_PATH" HOME=/var/root LC_ALL=C \
+    WG_QUICK_USERSPACE_IMPLEMENTATION="$LIBEXEC/wireguard-go" "$@"
+}
+# wg-quick needs bash >= 4; run it with the root-owned bash copy (never its shebang).
+wg_quick() { run_clean "$LIBEXEC/bash" "$LIBEXEC/wg-quick" "$@"; }
+
+list_names() {
+  local f n
+  shopt -s nullglob
+  for f in "$CONF_DIR"/*.conf; do
+    n=$(basename "$f" .conf)
+    [[ $n =~ $NAME_RE ]] && echo "$n"
+  done
+  return 0
+}
+
+check_name() {
+  [[ ${1:-} =~ $NAME_RE ]] || die "invalid tunnel name"
+  [ -f "$CONF_DIR/$1.conf" ] || die "no config $CONF_DIR/$1.conf"
+}
+
+# Prints utun interface if tunnel NAME is up (same check wg-quick uses on macOS).
+iface_of() {
+  local f="$RUN_DIR/$1.name" iface
+  [ -f "$f" ] || return 1
+  iface=$(<"$f")
+  [ -S "$RUN_DIR/$iface.sock" ] || return 1
+  echo "$iface"
+}
+
+# One line per tunnel: name<TAB>up|down<TAB>iface<TAB>latest_handshake_epoch<TAB>rx_bytes<TAB>tx_bytes
+status() {
+  local n iface stats
+  while IFS= read -r n; do
+    if iface=$(iface_of "$n"); then
+      stats=$(run_clean "$LIBEXEC/wg" show "$iface" dump 2>/dev/null \
+        | awk -F'\t' 'NR>1 { if ($5>h) h=$5; rx+=$6; tx+=$7 } END { printf "%.0f\t%.0f\t%.0f", h, rx, tx }') || true
+      printf '%s\tup\t%s\t%s\n' "$n" "$iface" "${stats:-0	0	0}"
+    else
+      printf '%s\tdown\t-\t0\t0\t0\n' "$n"
+    fi
+  done < <(list_names)
+}
+
+cmd=${1:-}
+case "$cmd" in
+  list)   list_names ;;
+  status) status ;;
+  up)
+    check_name "${2:-}"
+    if iface_of "$2" >/dev/null; then echo "$2 already up"; exit 0; fi
+    wg_quick up "$CONF_DIR/$2.conf"
+    ;;
+  down)
+    check_name "${2:-}"
+    if ! iface_of "$2" >/dev/null; then echo "$2 already down"; exit 0; fi
+    wg_quick down "$CONF_DIR/$2.conf"
+    ;;
+  *) die "usage: wgctl list | status | up NAME | down NAME" ;;
+esac

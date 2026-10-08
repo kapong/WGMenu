@@ -1,0 +1,134 @@
+#!/bin/bash
+# WGMenu root setup: helper, root-owned WireGuard tool copies, sudoers rule,
+# /etc/wireguard lockdown, /Applications entry.
+# Usage: sudo wgmenu-setup [--uninstall]   (from a source checkout: ./build.sh && sudo ./wgmenu-setup)
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin   # runs as root: no user-writable PATH entries
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+# The Homebrew formula rewrites the next three lines (helper/app under opt_prefix, app symlinked).
+HELPER_SRC="$HERE/helper/wgctl"
+APP_SRC="$HERE/build/WGMenu.app"
+LINK_APP=0
+LIBEXEC=/usr/local/libexec/wgmenu
+BREW=/opt/homebrew/opt
+
+usage() { echo "Usage: sudo wgmenu-setup [--uninstall]"; }
+
+uninstall() {
+  pkill -x WGMenu 2>/dev/null || true
+  if [ -x /usr/local/sbin/wgctl ]; then
+    { /usr/local/sbin/wgctl status 2>/dev/null | awk -F'\t' '$2=="up"{print $1}' | while read -r n; do
+      /usr/local/sbin/wgctl down "$n" || true
+    done; } || true   # best-effort: never block removal below
+  fi
+  rm -f /etc/sudoers.d/wgmenu /usr/local/sbin/wgctl
+  rm -rf "$LIBEXEC"
+  rm -rf /Applications/WGMenu.app   # removes only the symlink when linked
+  echo "Uninstalled helper, $LIBEXEC, sudoers rule and /Applications/WGMenu.app. Configs left in /etc/wireguard."
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --uninstall|"") ;;
+  *) usage; exit 1 ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo: sudo $0${1:+ $1}"; exit 1; }
+if [ "${1:-}" = --uninstall ]; then uninstall; exit 0; fi
+# sudoers targets /usr/local/sbin/wgctl: refuse if a non-root user could swap it
+# (e.g. a legacy Intel Homebrew /usr/local owned by the user).
+for d in /usr/local /usr/local/sbin; do
+  [ -e "$d" ] || continue
+  read -r uid mode <<< "$(stat -f '%u %Lp' "$d")"
+  if [ -L "$d" ] || [ "$uid" != 0 ] || [ $((0$mode & 022)) -ne 0 ]; then
+    echo "Refusing: $d must be a root-owned directory, not group/other-writable. Fix with:"
+    echo "  sudo chown root:wheel $d; sudo chmod go-w $d"
+    exit 1
+  fi
+done
+
+USER_NAME=${SUDO_USER:-}
+if [ -z "$USER_NAME" ] || [ "$USER_NAME" = root ]; then echo "Run via sudo from your normal account."; exit 1; fi
+
+# 1. Checks
+MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+[ "$MAJOR" -ge 13 ] || { echo "macOS 13+ required (found $(sw_vers -productVersion))"; exit 1; }
+[ "$(uname -m)" = arm64 ] || { echo "Apple Silicon (arm64) required"; exit 1; }
+for f in wireguard-tools/bin/wg-quick wireguard-tools/bin/wg wireguard-go/bin/wireguard-go bash/bin/bash; do
+  [ -x "$BREW/$f" ] || { echo "$BREW/$f not found. Run (as normal user): brew install wireguard-tools"; exit 1; }
+done
+xcrun -f install_name_tool >/dev/null 2>&1 || { echo "Command Line Tools required (otool/install_name_tool): xcode-select --install"; exit 1; }
+[ -f "$HELPER_SRC" ] || { echo "Helper not found: $HELPER_SRC"; exit 1; }
+[ -d "$APP_SRC" ] || { echo "App not found: $APP_SRC (from source: run ./build.sh as normal user)"; exit 1; }
+
+# 2. Root-owned copies of everything wgctl runs. /opt/homebrew is user-writable, so root
+# must never execute from it under NOPASSWD. Homebrew dylibs a binary links (bash links
+# readline/ncurses/gettext) are copied to $LIBEXEC/lib and load paths rewritten to them.
+# Re-run after `brew upgrade wireguard-tools` (or bash) to refresh the copies.
+# Built in $NEW, then swapped in; load paths/ids always name the final $LIBEXEC location.
+NEW="$LIBEXEC.new"
+# Copy Mach-O $1 to $NEW/$2 (root:wheel 755); copy and relink its non-system dylibs; ad-hoc re-sign.
+copy_macho() {
+  local src=$1 dst="$NEW/$2" id dep base changed=0
+  install -o root -g wheel -m 755 "$src" "$dst"
+  id=$(otool -D "$src" | sed -n 2p)
+  if [ -n "$id" ]; then install_name_tool -id "$LIBEXEC/$2" "$dst"; changed=1; fi
+  for dep in $(otool -L "$src" | tail -n +2 | awk '{print $1}'); do
+    case "$dep" in
+      /usr/lib/*|/System/*) continue ;;
+      "$id") continue ;;
+      /opt/homebrew/*) ;;
+      *) echo "Unsupported load path in $src: $dep"; exit 1 ;;
+    esac
+    base=$(basename "$dep")
+    if [ ! -f "$NEW/lib/$base" ]; then copy_macho "$dep" "lib/$base"; fi   # not `||`: keeps set -e active
+    install_name_tool -change "$dep" "$LIBEXEC/lib/$base" "$dst"; changed=1
+  done
+  if [ "$changed" = 1 ]; then codesign -f -s - "$dst"; fi
+  codesign -v "$dst" || { echo "Bad signature: $dst"; exit 1; }
+  if otool -L "$dst" | tail -n +2 | grep -q /opt/homebrew; then echo "Relink failed: $dst"; exit 1; fi
+}
+rm -rf "$NEW"
+install -d -o root -g wheel -m 755 /usr/local/libexec "$NEW" "$NEW/lib"
+copy_macho "$BREW/bash/bin/bash" bash
+copy_macho "$BREW/wireguard-tools/bin/wg" wg
+copy_macho "$BREW/wireguard-go/bin/wireguard-go" wireguard-go
+install -o root -g wheel -m 755 "$BREW/wireguard-tools/bin/wg-quick" "$NEW/wg-quick"
+rm -rf "$LIBEXEC"
+mv "$NEW" "$LIBEXEC"
+# Smoke tests need the final paths (dylibs load from $LIBEXEC/lib), so they run after the swap.
+SMOKE_FAIL="setup aborted before installing wgctl/sudoers; fix and re-run sudo wgmenu-setup"
+# shellcheck disable=SC2016
+"$LIBEXEC/bash" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' || { echo "Copied bash does not run: $SMOKE_FAIL"; exit 1; }
+"$LIBEXEC/wg" --version >/dev/null || { echo "Copied wg does not run: $SMOKE_FAIL"; exit 1; }
+
+# 2b. Helper: root-owned copy, installed once libexec is in place. sudoers must never
+# point into a user-writable path (e.g. Homebrew prefix).
+install -d -o root -g wheel -m 755 /usr/local/sbin
+install -o root -g wheel -m 755 "$HELPER_SRC" /usr/local/sbin/wgctl
+
+# 3. sudoers rule (validated before activation)
+TMP=$(mktemp)
+echo "$USER_NAME ALL=(root) NOPASSWD: /usr/local/sbin/wgctl" > "$TMP"
+visudo -cf "$TMP" >/dev/null || { rm -f "$TMP"; echo "sudoers validation failed"; exit 1; }
+install -o root -g wheel -m 440 "$TMP" /etc/sudoers.d/wgmenu
+rm -f "$TMP"
+
+# 4. Configs: root-only (prevents non-root injection of PostUp commands)
+install -d -o root -g wheel -m 700 /etc/wireguard
+shopt -s nullglob
+for f in /etc/wireguard/*.conf; do chown root:wheel "$f"; chmod 600 "$f"; done
+
+# 5. App
+rm -rf /Applications/WGMenu.app
+if [ "$LINK_APP" = 1 ]; then
+  ln -s "$APP_SRC" /Applications/WGMenu.app
+else
+  cp -R "$APP_SRC" /Applications/
+  chown -R "$USER_NAME":staff /Applications/WGMenu.app
+fi
+
+echo "Installed. Tunnels found:"
+/usr/local/sbin/wgctl list || true
+echo "Launch: open /Applications/WGMenu.app"
