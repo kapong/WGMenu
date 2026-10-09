@@ -26,15 +26,22 @@ enum Helper {
         let err: String
     }
 
-    static func run(_ args: [String]) -> Result {
+    static func run(_ args: [String], stdin: String? = nil) -> Result {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
         p.arguments = ["-n", path] + args          // -n: never prompt; fail if sudoers rule missing
-        let o = Pipe(), e = Pipe()
+        let o = Pipe(), e = Pipe(), i = Pipe()
         p.standardOutput = o
         p.standardError = e
+        if stdin != nil { p.standardInput = i }
         do { try p.run() } catch {
             return Result(status: -1, out: "", err: error.localizedDescription)
+        }
+        if let stdin {                              // small (a route plan): fits the pipe buffer
+            let w = i.fileHandleForWriting
+            _ = fcntl(w.fileDescriptor, F_SETNOSIGPIPE, 1)   // sudo/helper exiting unread must not kill us
+            try? w.write(contentsOf: Data(stdin.utf8))
+            try? w.close()
         }
         let od = o.fileHandleForReading.readDataToEndOfFile()
         let ed = e.fileHandleForReading.readDataToEndOfFile()
@@ -44,10 +51,10 @@ enum Helper {
                       err: String(decoding: ed, as: UTF8.self))
     }
 
-    static func runAsync(_ args: [String]) async -> Result {
+    static func runAsync(_ args: [String], stdin: String? = nil) async -> Result {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
-                cont.resume(returning: run(args))
+                cont.resume(returning: run(args, stdin: stdin))
             }
         }
     }
@@ -78,6 +85,8 @@ final class TunnelStore: ObservableObject {
     private var watcher: NetworkWatcher?
     private var gatewayTask: Task<Void, Never>?
     private var lastGatewayMAC: String?                 // last resolved gateway MAC; nil until the first one
+    private var applying = false                        // an applyRoutes() pass is running
+    private var applyAgain = false                      // ... and another was asked for meanwhile
 
     var activeCount: Int { tunnels.filter(\.isUp).count }
 
@@ -100,7 +109,8 @@ final class TunnelStore: ObservableObject {
                 await self.refresh()
             }
         }
-        watcher = NetworkWatcher { [weak self] in Task { @MainActor in self?.checkGateway() } }
+        // New network: office check, and routes again (a full tunnel's endpoint route follows the gateway).
+        watcher = NetworkWatcher { [weak self] in Task { @MainActor in self?.checkGateway(); self?.applyRoutes() } }
         checkGateway()                                  // launching on an office network counts as arrival
     }
 
@@ -158,14 +168,20 @@ final class TunnelStore: ObservableObject {
         busy.insert(name)
         if action == "up" { upInFlight.insert(name) }
         Task {
-            if action == "up", !(await routesOK(name)) {
-                busy.remove(name)
-                upInFlight.remove(name)
-                return
+            var args = [action, name]
+            if action == "up" {
+                guard let routes = await routesOK(name) else {
+                    busy.remove(name)
+                    upInFlight.remove(name)
+                    return
+                }
+                // DNS follows priority: a higher tunnel that sets DNS keeps it.
+                if let owner = routePlan(routes).dnsOwner, owner != name { args.append("nodns") }
             }
-            let r = await Helper.runAsync([action, name])
+            let r = await Helper.runAsync(args)
             lastError = r.status == 0 ? nil : "\(action) \(name) failed: " + Self.explain(r)
             await refresh()
+            if r.status == 0 { applyRoutes() }
             busy.remove(name)
             upInFlight.remove(name)
         }
@@ -173,28 +189,61 @@ final class TunnelStore: ObservableObject {
 
     // Before every `up`: compare AllowedIPs/DNS with the tunnels already up (read through `wgctl routes`,
     // which prints no keys). Asks every time, Cancel by default; no "don't ask again".
-    private func routesOK(_ name: String) async -> Bool {
+    // Returns the routes read (`name` and the others; empty if they couldn't be read), nil on Cancel.
+    private func routesOK(_ name: String) async -> [String: RouteRules.Routes]? {
         await refresh()
         // Other `up` toggles still running count too: `wgctl routes` reads down tunnels' configs as well.
         var up = tunnels.filter(\.isUp).map(\.name)
         up += upInFlight.subtracting(up).sorted()
         up.removeAll { $0 == name }
-        guard !up.isEmpty else { return true }
+        guard !up.isEmpty else { return [:] }
         var routes: [String: RouteRules.Routes] = [:]
         for n in [name] + up {
             let r = await Helper.runAsync(["routes", n])
             guard r.status == 0 else {
                 NSApp.activate(ignoringOtherApps: true)
-                return Self.confirm("Connect \(name)?", "Can't check for conflicts — re-run wgmenu-setup to update the helper.", ok: "Continue")
+                return Self.confirm("Connect \(name)?", "Can't check for conflicts — re-run wgmenu-setup to update the helper.", ok: "Continue") ? [:] : nil
             }
             routes[n] = RouteRules.parseRoutes(r.out)
         }
         let issues = RouteRules.conflicts(routes[name]!, with: up.map { ($0, routes[$0]!) })
-        guard !issues.isEmpty else { return true }
+        guard !issues.isEmpty else { return routes }
         NSApp.activate(ignoringOtherApps: true)
         return Self.confirm("\(name) conflicts with a connected tunnel",
                             issues.map { "• " + $0 }.joined(separator: "\n") + "\n\nConnecting may break traffic of either tunnel.",
-                            ok: "Continue")
+                            ok: "Continue") ? routes : nil
+    }
+
+    // WGMenu owns the routes of the tunnels it brought up (`wgctl up` uses Table = off): after every
+    // up, down, priority change and network change, read each up tunnel's AllowedIPs, compute the
+    // priority plan and hand it to `wgctl apply-routes`, which skips tunnels started outside WGMenu.
+    // One pass at a time; calls during a pass queue exactly one more, which reads fresh state.
+    func applyRoutes() {
+        guard !applying else { applyAgain = true; return }
+        applying = true
+        Task {
+            repeat {
+                applyAgain = false
+                await applyRoutesOnce()
+            } while applyAgain
+            applying = false
+        }
+    }
+
+    private func applyRoutesOnce() async {
+        await refresh()
+        let up = tunnels.filter(\.isUp).map(\.name)
+        guard !up.isEmpty else { return }               // `down` already removed its own routes
+        var routes: [String: RouteRules.Routes] = [:]
+        for n in up {
+            let r = await Helper.runAsync(["routes", n])
+            // A missing tunnel would lose all its routes, so apply nothing rather than a partial plan.
+            guard r.status == 0 else { lastError = "Routes not applied: " + Self.explain(r); return }
+            routes[n] = RouteRules.parseRoutes(r.out)
+        }
+        let plan = routePlan(routes).routes.flatMap { t in t.routes.map { "\(t.name) \($0)\n" } }.joined()
+        let r = await Helper.runAsync(["apply-routes"], stdin: plan)
+        if r.status != 0 { lastError = "Routes not applied: " + Self.explain(r) }
     }
 
     // Office auto-off: when the gateway MAC changes to one a tunnel lists and that tunnel is up, take
@@ -265,6 +314,7 @@ final class TunnelStore: ObservableObject {
         guard let i = names.firstIndex(of: t.name), names.indices.contains(i + offset) else { return }
         names.swapAt(i, i + offset)
         setPriority(names)
+        if activeCount > 1 { applyRoutes() }
     }
 
     private func setPriority(_ names: [String]) {
@@ -293,6 +343,7 @@ final class TunnelStore: ObservableObject {
             lastError = errors.isEmpty ? nil : errors.joined(separator: "\n")
             await refresh()
             busy.subtract(up)
+            if errors.count < up.count { applyRoutes() }
         }
     }
 
@@ -464,6 +515,7 @@ final class TunnelStore: ObservableObject {
                 let r = await Helper.runAsync(["down", name])
                 downOK = r.status == 0
                 if !downOK { lastError = "down \(name) failed: " + Self.explain(r) }
+                else { applyRoutes() }
             }
             if downOK {
                 if Self.privileged(ConfigImport.shellScript(cmd), failure: "Delete failed") != nil {
@@ -500,6 +552,9 @@ final class TunnelStore: ObservableObject {
         let lines = r.err.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
         if lines.contains(where: { $0.contains("a password is required") }) {
             return "sudo rule missing. Run: sudo wgmenu-setup"
+        }
+        if lines.contains(where: { $0.contains("wgctl: usage:") }) {   // a helper older than this app
+            return "The helper is out of date. Re-run: sudo wgmenu-setup"
         }
         let tail = lines.suffix(3).joined(separator: "\n")
         return tail.isEmpty ? "exit code \(r.status)" : tail

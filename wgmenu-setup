@@ -23,7 +23,7 @@ uninstall() {
     done; } || true   # best-effort: never block removal below
   fi
   rm -f /etc/sudoers.d/wgmenu /usr/local/sbin/wgctl
-  rm -rf "$LIBEXEC"
+  rm -rf "$LIBEXEC" /var/run/wgmenu
   rm -rf /Applications/WGMenu.app   # removes only the symlink when linked
   echo "Uninstalled helper, $LIBEXEC, sudoers rule and /Applications/WGMenu.app. Configs left in /etc/wireguard."
 }

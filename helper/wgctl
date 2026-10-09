@@ -1,6 +1,6 @@
 #!/bin/bash
 # wgctl — privileged helper for WGMenu. Installed root:wheel 755 at /usr/local/sbin/wgctl.
-# Usage: wgctl list | status | routes NAME | up NAME | down NAME
+# Usage: wgctl list | status | routes NAME | up NAME [nodns] | down NAME | apply-routes (stdin)
 # Bash 3.2 compatible (macOS /bin/bash).
 set -euo pipefail
 # Runs as root via NOPASSWD sudo, so everything it executes must be root-owned.
@@ -12,6 +12,11 @@ export PATH="$SAFE_PATH"
 
 CONF_DIR=/etc/wireguard
 RUN_DIR=/var/run/wireguard
+# Root-only (700): NAME.conf copies WGMenu brings tunnels up with (Table = off, so wg-quick adds no
+# routes), the routes file listing every route apply-routes installed, and a lock. /var/run is
+# cleared on reboot, and so are the routes.
+STATE_DIR=/var/run/wgmenu
+STATE=$STATE_DIR/routes
 NAME_RE='^[a-zA-Z0-9_=+.-]{1,15}$'
 
 die() { echo "wgctl: $*" >&2; exit 1; }
@@ -47,7 +52,8 @@ run_clean() {
     WG_QUICK_USERSPACE_IMPLEMENTATION="$LIBEXEC/wireguard-go" "$@"
 }
 # wg-quick needs bash >= 4; run it with the root-owned bash copy (never its shebang).
-wg_quick() { run_clean "$LIBEXEC/bash" "$LIBEXEC/wg-quick" "$@"; }
+# fd 9 (the state lock) is closed for it: its backgrounded route monitor would hold the lock forever.
+wg_quick() { run_clean "$LIBEXEC/bash" "$LIBEXEC/wg-quick" "$@" 9>&-; }
 
 list_names() {
   local f n
@@ -104,6 +110,203 @@ routes() {
     }' "$CONF_DIR/$1.conf"
 }
 
+# Creates $STATE_DIR if needed, refuses anything but a root-owned 700 directory, and takes the lock
+# that serializes up, down and apply-routes (released when this process exits).
+prepare_state() {
+  local uid mode
+  [ ! -L "$STATE_DIR" ] || die "refusing: $STATE_DIR is a symlink"
+  [ -d "$STATE_DIR" ] || mkdir -m 700 "$STATE_DIR"
+  read -r uid mode <<< "$(/usr/bin/stat -f '%u %Lp' "$STATE_DIR")"
+  [ "$uid" = 0 ] && [ "$mode" = 700 ] || die "refusing: $STATE_DIR must be root-owned with mode 700"
+  umask 077
+  exec 9>>"$STATE_DIR/lock"
+  lockf -s -t 60 9 || die "busy: another wgctl call holds $STATE_DIR/lock"
+}
+
+# Prints config $1 with "Table = off" added right after the first [Interface] header and every
+# Table line of [Interface] dropped, plus its DNS lines when $2 is non-empty. Everything else is
+# kept byte for byte. Lines are matched like wg-quick parses them: text after "#" dropped, key
+# trimmed, case-insensitive; any "[..." line ends the [Interface] section. Fails without [Interface].
+temp_conf() {
+  awk -v nodns="$2" '
+    function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+    {
+      s = $0; sub(/#.*/, "", s); i = index(s, "=")
+      key = tolower(trim(i ? substr(s, 1, i - 1) : s))
+      if (key ~ /^\[/) iface = (key == "[interface]")
+      if (iface && (key == "table" || (nodns != "" && key == "dns"))) next
+      print
+      if (iface && !done) { print "Table = off"; done = 1 }
+    }
+    END { exit !done }' "$1"
+}
+
+# Writes $STATE_DIR/NAME.conf (kept as NAME.conf: wg-quick takes the interface name from it).
+# Written beside it and renamed, so a symlink in its place is replaced, never followed.
+make_temp_conf() {
+  local src="$CONF_DIR/$1.conf" new="${STATE_DIR:?}/.$1.conf.new"
+  [ ! -L "$src" ] || die "refusing: $1.conf is a symlink"
+  rm -f "${new:?}"
+  temp_conf "$src" "$2" > "$new" || { rm -f "${new:?}"; die "$1.conf has no [Interface] section"; }
+  mv -f "$new" "$STATE_DIR/$1.conf"
+}
+
+V4_OCTET='(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])'
+valid_v4() { [[ $1 =~ ^$V4_OCTET(\.$V4_OCTET){3}$ ]]; }
+
+# IPv6: hex groups only, at most one "::", 8 groups without it and at most 7 with it. No embedded
+# IPv4, no zone. v6_side checks one side of "::" and sets V6_N to its group count.
+v6_side() {
+  local g
+  V6_N=0
+  [ -n "$1" ] || return 0
+  [[ $1 != :* && $1 != *: ]] || return 1
+  for g in ${1//:/ }; do [[ $g =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1; V6_N=$((V6_N + 1)); done
+}
+valid_v6() {
+  local n
+  [[ $1 =~ ^[0-9a-fA-F:]{2,39}$ && $1 != *:::* ]] || return 1
+  case $1 in
+    *::*::*) return 1 ;;
+    *::*) v6_side "${1%%::*}" || return 1; n=$V6_N
+          v6_side "${1#*::}" || return 1; [ $((n + V6_N)) -le 7 ] ;;
+    *) v6_side "$1" && [ "$V6_N" -eq 8 ] ;;
+  esac
+}
+
+# IPv4 a.b.c.d/0-32 with no host bits set, or IPv6 (see valid_v6) /0-128. No leading zeros.
+valid_cidr() {
+  local addr=${1%/*} len=${1##*/} a b c d mask
+  [[ $1 == */* && $len =~ ^(0|[1-9][0-9]?|1[0-9][0-9])$ ]] || return 1
+  if valid_v4 "$addr"; then
+    [ "$len" -le 32 ] || return 1
+    IFS=. read -r a b c d <<< "$addr"
+    mask=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    [ $(( ((a << 24) | (b << 16) | (c << 8) | d) & ~mask & 0xFFFFFFFF )) -eq 0 ]
+  else
+    valid_v6 "$addr" && [ "$len" -le 128 ]
+  fi
+}
+
+# Real default gateway for family $1 (inet|inet6); nothing if there is none, it is not a plain
+# address (IPv6 may carry a %zone), or the default route itself goes through a tunnel.
+default_gw() {
+  local out gw
+  out=$(route -n get "-$1" default 2>/dev/null) || return 0
+  gw=$(awk '$1 == "gateway:" { g = $2 } $1 == "interface:" { i = $2 }
+            END { if (i != "" && i !~ /^utun/) print g }' <<< "$out")
+  if [ "$1" = inet ]; then
+    valid_v4 "$gw" || return 0
+  else
+    valid_v6 "${gw%\%*}" || return 0
+    [[ $gw != *%* || ${gw#*%} =~ ^[a-z0-9]{1,15}$ ]] || return 0
+  fi
+  echo "$gw"
+}
+
+# Peer endpoint addresses of interface $1, one per line (only the address: never keys).
+endpoint_ips() {
+  local ep
+  while read -r _ ep; do
+    [[ $ep =~ ^\[?([0-9a-fA-F:.]+)\]?:[0-9]+$ ]] && echo "${BASH_REMATCH[1]}"
+  done < <(run_clean "$LIBEXEC/wg" show "$1" endpoints 2>/dev/null || true)
+}
+
+# Reads the app's route plan from stdin, "NAME CIDR" per line, and prints the state lines it asks
+# for (see reconcile). Any malformed or duplicate line rejects the whole input. Tunnels not brought
+# up by `wgctl up` (no NAME.conf copy, or not up) are skipped with a note: their routes are wg-quick's.
+# A tunnel with a /1 route (full tunnel) also gets a host route via the real gateway for each peer
+# endpoint of that family, so its own encrypted traffic doesn't loop into the tunnel.
+desired_routes() {
+  local line name cidr pairs="" names="" dests=$'\n' n=0 iface fam re gw ip eps=$'\n'
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    n=$((n + 1))
+    [ "$n" -le 4096 ] || die "apply-routes: too many routes"
+    [[ $line =~ ^([^ ]+)\ ([^ ]+)$ ]] || die "apply-routes: bad line $n"
+    name=${BASH_REMATCH[1]} cidr=${BASH_REMATCH[2]}
+    [[ $name =~ $NAME_RE ]] || die "apply-routes: invalid tunnel name on line $n"
+    valid_cidr "$cidr" || die "apply-routes: invalid CIDR on line $n"
+    [[ $dests != *$'\n'"$cidr"$'\n'* ]] || die "apply-routes: $cidr listed twice"
+    dests+="$cidr"$'\n'
+    pairs+="$name $cidr"$'\n'
+    [[ $'\n'$names == *$'\n'"$name"$'\n'* ]] || names+="$name"$'\n'
+  done
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ ! -f "$STATE_DIR/$name.conf" ] || [ -L "$STATE_DIR/$name.conf" ] || ! iface=$(iface_of "$name") \
+      || [[ ! $iface =~ ^utun[0-9]+$ ]]; then
+      echo "wgctl: $name was not started by WGMenu; routes left alone" >&2
+      continue
+    fi
+    awk -v n="$name" -v i="$iface" '$1 == n { print n " net " $2 " " i }' <<< "$pairs"
+    for fam in inet inet6; do
+      if [ $fam = inet ]; then re='^[0-9.]+/1$'; else re='^[0-9a-fA-F:]+/1$'; fi
+      awk -v n="$name" -v re="$re" '$1 == n && $2 ~ re { f = 1 } END { exit !f }' <<< "$pairs" || continue
+      gw=$(default_gw $fam)
+      [ -n "$gw" ] || { echo "wgctl: no usable $fam default gateway; $name endpoint routes skipped" >&2; continue; }
+      while IFS= read -r ip; do
+        if [ $fam = inet ]; then valid_v4 "$ip" || continue; else valid_v6 "$ip" || continue; fi
+        [[ $eps != *$'\n'"$ip"$'\n'* ]] || continue     # same endpoint as another tunnel: one route
+        eps+="$ip"$'\n'
+        echo "$name endpoint $ip $gw"
+      done < <(endpoint_ips "$iface")
+    done
+  done <<< "$names"
+}
+
+state_lines() { if [ -f "$STATE" ]; then cat "$STATE"; fi; }
+has_line() { grep -Fxq -- "$2" <<< "$1"; }
+
+# route_cmd add|delete NAME KIND DEST VIA
+route_cmd() {
+  local fam=-inet
+  [[ $4 != *:* ]] || fam=-inet6
+  case $3 in
+    net) route -q -n "$1" "$fam" "$4" -interface "$5" ;;
+    endpoint) route -q -n "$1" "$fam" -host "$4" "$5" ;;
+    *) return 1 ;;
+  esac
+}
+
+# route_present NAME KIND DEST VIA. Endpoint routes can vanish when the link goes down, so they are
+# looked up; net routes live as long as their utun.
+route_present() {
+  local fam=-inet
+  [ "$2" = endpoint ] || return 0
+  [[ $3 != *:* ]] || fam=-inet6
+  route -n get "$fam" "$3" 2>/dev/null \
+    | awk -v d="$3" -v g="$4" '$1 == "destination:" && $2 == d { dd = 1 } $1 == "gateway:" && $2 == g { gg = 1 }
+                               END { exit !(dd && gg) }'
+}
+
+# State file: one route per line, "NAME KIND DEST VIA": KIND net (DEST a CIDR, VIA its utunN) or
+# endpoint (DEST a peer address, VIA the gateway). Makes the system match $1 (same format): deletes
+# recorded routes not in $1 first, then adds missing ones, and atomically rewrites the state file
+# with what is in place. Running it twice changes nothing. Fails if any route could not be added.
+reconcile() {
+  local old line keep="" failed=0
+  old=$(state_lines)
+  while IFS= read -r line; do
+    if [ -z "$line" ] || has_line "$1" "$line"; then continue; fi
+    # shellcheck disable=SC2086  # four validated words
+    route_cmd delete $line >/dev/null 2>&1 || true   # already gone with its utun: fine
+  done <<< "$old"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # shellcheck disable=SC2086
+    if { has_line "$old" "$line" && route_present $line; } || route_cmd add $line >/dev/null 2>&1; then
+      keep+="$line"$'\n'
+    else
+      echo "wgctl: could not add route ${line#* }" >&2
+      failed=1
+    fi
+  done <<< "$1"
+  printf '%s' "$keep" > "$STATE.new"
+  mv -f "$STATE.new" "$STATE"
+  return $failed
+}
+
 cmd=${1:-}
 case "$cmd" in
   list)   list_names ;;
@@ -111,13 +314,26 @@ case "$cmd" in
   routes) check_name "${2:-}"; routes "$2" ;;
   up)
     check_name "${2:-}"
+    case "${3:-}" in ""|nodns) ;; *) die "usage: wgctl up NAME [nodns]" ;; esac
     if iface_of "$2" >/dev/null; then echo "$2 already up"; exit 0; fi
-    wg_quick up "$CONF_DIR/$2.conf"
+    prepare_state
+    make_temp_conf "$2" "${3:-}"
+    wg_quick up "$STATE_DIR/$2.conf" || { rm -f "${STATE_DIR:?}/$2.conf"; exit 1; }
     ;;
   down)
     check_name "${2:-}"
-    if ! iface_of "$2" >/dev/null; then echo "$2 already down"; exit 0; fi
+    prepare_state
+    keep=$(state_lines | awk -v n="$2" '$1 != n')
+    reconcile "$keep" || true                 # drops NAME's routes; others are only re-checked
+    if ! iface_of "$2" >/dev/null; then rm -f "${STATE_DIR:?}/$2.conf"; echo "$2 already down"; exit 0; fi
+    # The original config, not the copy: same hooks, and SaveConfig = true must save into it.
     wg_quick down "$CONF_DIR/$2.conf"
+    rm -f "${STATE_DIR:?}/$2.conf"
     ;;
-  *) die "usage: wgctl list | status | routes NAME | up NAME | down NAME" ;;
+  apply-routes)
+    prepare_state
+    want=$(desired_routes)
+    reconcile "$want"
+    ;;
+  *) die "usage: wgctl list | status | routes NAME | up NAME [nodns] | down NAME | apply-routes" ;;
 esac
