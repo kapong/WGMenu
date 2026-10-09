@@ -206,7 +206,8 @@ final class TunnelStore: ObservableObject {
             }
             routes[n] = RouteRules.parseRoutes(r.out)
         }
-        let issues = RouteRules.conflicts(routes[name]!, with: up.map { ($0, routes[$0]!) })
+        let higher = Set(ordered.map(\.name).prefix(while: { $0 != name }))
+        let issues = RouteRules.conflicts(routes[name]!, with: up.map { ($0, routes[$0]!) }, higher: higher)
         guard !issues.isEmpty else { return routes }
         NSApp.activate(ignoringOtherApps: true)
         return Self.confirm("\(name) conflicts with a connected tunnel",
@@ -428,7 +429,7 @@ final class TunnelStore: ObservableObject {
             ok: ok)
     }
 
-    // Import and Save: a /0 in any peer's AllowedIPs gets a warning. true = proceed (not a full tunnel,
+    // Import and Save: a /0 (or both /1 halves) in any peer's AllowedIPs gets a warning. true = proceed (not a full tunnel,
     // or Keep full tunnel); false = the user chose Edit AllowedIPs.
     static func keepFullTunnel(_ name: String, _ text: String) -> Bool {
         let cfg = WGConfig(text)
@@ -436,7 +437,7 @@ final class TunnelStore: ObservableObject {
         let a = NSAlert()
         a.alertStyle = .warning
         a.messageText = RouteRules.fullTunnelWarning
-        a.informativeText = "\(name) has AllowedIPs 0.0.0.0/0 or ::/0, so it takes every connection and clashes with any other tunnel.\n\n"
+        a.informativeText = "\(name) has AllowedIPs 0.0.0.0/0 or ::/0 (or both /1 halves), so it takes every connection and clashes with any other tunnel.\n\n"
             + RouteRules.fullTunnelHint(addresses: cfg.addresses)
         a.addButton(withTitle: "Keep full tunnel")
         a.addButton(withTitle: "Edit AllowedIPs")
@@ -919,7 +920,8 @@ final class EditorWindow: NSObject, NSWindowDelegate {
             model: model,
             save: { [weak self] in
                 // Edit AllowedIPs: stay open, in Form mode at that field.
-                guard model.text == model.original || TunnelStore.keepFullTunnel(name, model.text) else {
+                // An import isn't installed yet, so unchanged text still needs the Keep confirmation.
+                guard (importing == nil && model.text == model.original) || TunnelStore.keepFullTunnel(name, model.text) else {
                     return model.showAllowedIPs()
                 }
                 if store.save(name: name, original: model.original, edited: model.text,

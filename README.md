@@ -87,7 +87,7 @@ WireGuard needs root to bring tunnels up. WGMenu keeps that surface small:
 - Priority routing needs the current helper: re-run `sudo wgmenu-setup` after upgrading (WGMenu says the helper is out of date otherwise).
 - Priority routing applies only to tunnels WGMenu connects. A tunnel started outside WGMenu (e.g. `wg-quick up` in Terminal) keeps `wg-quick`'s own routes and WGMenu leaves them alone; disconnect it and connect it from WGMenu.
 - DNS does not move to a lower-priority tunnel when a higher one disconnects. Reconnect the lower tunnel to give it DNS.
-- Overlapping `AllowedIPs`, two full tunnels or two `DNS` settings still deserve a look: Import and Save warn about a full tunnel (`0.0.0.0/0` or `::/0`) and suggest the VPN subnet instead, and every connect warns when the tunnel overlaps a connected one, both are full tunnels, or both set `DNS`.
+- Overlapping `AllowedIPs`, two full tunnels or two `DNS` settings still deserve a look: Import and Save warn about a full tunnel (`0.0.0.0/0`, `::/0` or both `/1` halves) and suggest the VPN subnet instead, and every connect warns when the tunnel overlaps a connected one, both are full tunnels for the same address family, or both set `DNS`, and says which tunnel wins by priority.
 - Don't run the same tunnel in the official WireGuard app at the same time.
 - An idle tunnel without keepalives receives nothing and turns orange after 3 minutes. Add `PersistentKeepalive = 25` to its `[Peer]` section to keep it green.
 - macOS may ask you to approve WGMenu under System Settings > General > Login Items.

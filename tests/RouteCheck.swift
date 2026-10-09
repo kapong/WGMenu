@@ -67,18 +67,32 @@ enum RouteCheck {
         let full = RouteRules.Routes(allowedIPs: ["0.0.0.0/0", "::/0"], dns: ["1.1.1.1"])
         let office = RouteRules.Routes(allowedIPs: ["10.1.0.0/16"], dns: [])
         let home = RouteRules.Routes(allowedIPs: ["192.168.50.0/24"], dns: ["192.168.50.1"])
-        check(RouteRules.conflicts(office, with: [("home", home)]).isEmpty, "disjoint, one DNS: no conflict")
-        let c1 = RouteRules.conflicts(full, with: [("office", office)])
-        check(c1 == ["AllowedIPs overlap with office: 0.0.0.0/0 ↔ 10.1.0.0/16"], "full vs split: \(c1)")
-        let c2 = RouteRules.conflicts(full, with: [("vpn2", full)])
-        check(c2 == ["vpn2 is also a full tunnel (0.0.0.0/0 or ::/0).", "DNS is also set by vpn2 (1.1.1.1)."], "two full: \(c2)")
-        let c3 = RouteRules.conflicts(home, with: [("vpn2", full), ("office", office)])
-        check(c3 == ["AllowedIPs overlap with vpn2: 192.168.50.0/24 ↔ 0.0.0.0/0", "DNS is also set by vpn2 (1.1.1.1)."], "names other: \(c3)")
+        check(RouteRules.conflicts(office, with: [("home", home)], higher: []).isEmpty, "disjoint, one DNS: no conflict")
+        let c1 = RouteRules.conflicts(full, with: [("office", office)], higher: ["office"])
+        check(c1 == ["AllowedIPs overlap with office: 0.0.0.0/0 ↔ 10.1.0.0/16. office has higher priority and keeps it."], "full vs split: \(c1)")
+        let c2 = RouteRules.conflicts(full, with: [("vpn2", full)], higher: [])
+        check(c2 == ["vpn2 is also a full tunnel for 0.0.0.0/0 and ::/0 (or the /1 halves). This tunnel has higher priority and takes it.",
+                     "DNS is also set by vpn2 (1.1.1.1). This tunnel has higher priority and takes it."], "two full: \(c2)")
+        let c3 = RouteRules.conflicts(home, with: [("vpn2", full), ("office", office)], higher: ["vpn2"])
+        check(c3 == ["AllowedIPs overlap with vpn2: 192.168.50.0/24 ↔ 0.0.0.0/0. vpn2 has higher priority and keeps it.",
+                     "DNS is also set by vpn2 (1.1.1.1). vpn2 has higher priority and keeps it."], "names other: \(c3)")
         let halves = RouteRules.Routes(allowedIPs: ["0.0.0.0/1", "128.0.0.0/1"])
-        let c4 = RouteRules.conflicts(halves, with: [("vpn2", full)])
-        check(c4 == ["vpn2 is also a full tunnel (0.0.0.0/0 or ::/0)."], "halves vs full: \(c4)")
-        let v6 = RouteRules.conflicts(.init(allowedIPs: ["fd00:1::/32"]), with: [("x", .init(allowedIPs: ["fd00::/16"]))])
-        check(v6 == ["AllowedIPs overlap with x: fd00:1::/32 ↔ fd00::/16"], "v6 conflict: \(v6)")
+        let c4 = RouteRules.conflicts(halves, with: [("vpn2", full)], higher: ["vpn2"])
+        check(c4 == ["vpn2 is also a full tunnel for 0.0.0.0/0 (or the /1 halves). vpn2 has higher priority and keeps it."], "halves vs full: \(c4)")
+        // Full in different families: no shared traffic, so no conflict.
+        let v4full = RouteRules.Routes(allowedIPs: ["0.0.0.0/0"]), v6full = RouteRules.Routes(allowedIPs: ["::/0"])
+        check(RouteRules.conflicts(v4full, with: [("v6", v6full)], higher: []).isEmpty, "v4 full vs v6 full: no conflict")
+        check(RouteRules.conflicts(halves, with: [("v6", .init(allowedIPs: ["::/1", "8000::/1"]))], higher: []).isEmpty, "v4 halves vs v6 halves")
+        // Both full for IPv4 only; v6 subnets still compared.
+        let c5 = RouteRules.conflicts(.init(allowedIPs: ["0.0.0.0/0", "fd00::/16"]), with: [("x", .init(allowedIPs: ["0.0.0.0/1", "128.0.0.0/1", "fd00:1::/32"]))], higher: [])
+        check(c5 == ["x is also a full tunnel for 0.0.0.0/0 (or the /1 halves). This tunnel has higher priority and takes it.",
+                     "AllowedIPs overlap with x: fd00::/16 ↔ fd00:1::/32. This tunnel has higher priority and takes it."], "v4-only both full: \(c5)")
+        // A v6 full tunnel against a v4 full one still reports its v4 subnet overlap.
+        let c6 = RouteRules.conflicts(.init(allowedIPs: ["::/0", "10.1.0.0/16"]), with: [("x", v4full)], higher: ["x"])
+        check(c6 == ["AllowedIPs overlap with x: 10.1.0.0/16 ↔ 0.0.0.0/0. x has higher priority and keeps it."], "mixed full: \(c6)")
+        check(RouteRules.fullFamilies(["0.0.0.0/0", "::/1"]) == [4] && RouteRules.fullFamilies(["::/1", "8000::/1"]) == [16], "full families")
+        let v6 = RouteRules.conflicts(.init(allowedIPs: ["fd00:1::/32"]), with: [("x", .init(allowedIPs: ["fd00::/16"]))], higher: [])
+        check(v6 == ["AllowedIPs overlap with x: fd00:1::/32 ↔ fd00::/16. This tunnel has higher priority and takes it."], "v6 conflict: \(v6)")
 
         // Subtraction.
         func sub(_ a: String, _ b: String) -> [String] { RouteRules.subtract(cidr(a), cidr(b)).map(\.description) }

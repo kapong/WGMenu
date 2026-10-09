@@ -111,11 +111,16 @@ enum RouteRules {
 
     // Any /0 (0.0.0.0/0, ::/0), or both /1 halves (0.0.0.0/1 + 128.0.0.0/1, ::/1 + 8000::/1), routes
     // everything of that family through the tunnel.
-    static func isFullTunnel(_ allowedIPs: [String]) -> Bool {
+    static func isFullTunnel(_ allowedIPs: [String]) -> Bool { !fullFamilies(allowedIPs).isEmpty }
+
+    // The families (address size: 4 = IPv4, 16 = IPv6) that `allowedIPs` covers entirely.
+    static func fullFamilies(_ allowedIPs: [String]) -> Set<Int> {
         let cidrs = allowedIPs.compactMap(parse)
-        return cidrs.contains { $0.prefix == 0 } || [4, 16].contains { n in
-            Set(cidrs.filter { $0.bytes.count == n && $0.prefix == 1 }.map { $0.network[0] }).count == 2
-        }
+        return Set([4, 16].filter { n in
+            let mine = cidrs.filter { $0.bytes.count == n }
+            return mine.contains { $0.prefix == 0 }
+                || Set(mine.filter { $0.prefix == 1 }.map { $0.network[0] }).count == 2
+        })
     }
 
     // The VPN subnet(s) from Interface Address: "10.8.0.2/24" -> "10.8.0.0/24". Host-only (/32, /128)
@@ -164,19 +169,24 @@ enum RouteRules {
         return r
     }
 
-    // Reasons connecting `target` clashes with tunnels already up, naming each other tunnel.
-    static func conflicts(_ target: Routes, with others: [(name: String, routes: Routes)]) -> [String] {
-        let full = isFullTunnel(target.allowedIPs)
+    // Reasons connecting `target` clashes with tunnels already up, naming each other tunnel and which
+    // side wins by priority. `higher`: the names among `others` ranked above `target`.
+    static func conflicts(_ target: Routes, with others: [(name: String, routes: Routes)], higher: Set<String>) -> [String] {
+        let full = fullFamilies(target.allowedIPs)
         return others.flatMap { o -> [String] in
             var out: [String] = []
-            let bothFull = full && isFullTunnel(o.routes.allowedIPs)
-            if bothFull { out.append("\(o.name) is also a full tunnel (0.0.0.0/0 or ::/0).") }
-            // When both are full, default against default (/0 or /1 halves) is already said above.
+            let wins = higher.contains(o.name) ? " \(o.name) has higher priority and keeps it." : " This tunnel has higher priority and takes it."
+            let bothFull = full.intersection(fullFamilies(o.routes.allowedIPs))
+            if !bothFull.isEmpty {
+                let defaults = [(4, "0.0.0.0/0"), (16, "::/0")].filter { bothFull.contains($0.0) }.map(\.1)
+                out.append("\(o.name) is also a full tunnel for \(defaults.joined(separator: " and ")) (or the /1 halves)." + wins)
+            }
+            // Default against default (/0 or /1 halves) of a family both cover fully is already said above.
             let pairs = overlapPairs(target.allowedIPs, o.routes.allowedIPs)
-                .filter { !bothFull || $0.0.prefix > 1 || $0.1.prefix > 1 }.map { "\($0) ↔ \($1)" }
-            if !pairs.isEmpty { out.append("AllowedIPs overlap with \(o.name): " + pairs.joined(separator: ", ")) }
+                .filter { !bothFull.contains($0.0.bytes.count) || $0.0.prefix > 1 || $0.1.prefix > 1 }.map { "\($0) ↔ \($1)" }
+            if !pairs.isEmpty { out.append("AllowedIPs overlap with \(o.name): " + pairs.joined(separator: ", ") + "." + wins) }
             if !target.dns.isEmpty, !o.routes.dns.isEmpty {
-                out.append("DNS is also set by \(o.name) (\(o.routes.dns.joined(separator: ", "))).")
+                out.append("DNS is also set by \(o.name) (\(o.routes.dns.joined(separator: ", ")))." + wins)
             }
             return out
         }
