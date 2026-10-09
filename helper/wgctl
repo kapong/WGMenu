@@ -126,21 +126,35 @@ prepare_state() {
 
 # Serializes up, down and apply-routes. The lock is a symlink naming the holder's pid: creating it is
 # atomic and carries the pid, so there is no half-made state. Removed on exit; a lock whose holder is
-# no longer a wgctl process (killed mid-call) is broken. Waits up to 60 s. Plain shell on purpose:
+# no longer a root wgctl process (killed mid-call) is broken. Waits up to 60 s. Plain shell on purpose:
 # lockf(1) on macOS 13-15 can only wrap a whole command, not lock from inside a script.
 lock_state() {
-  local lock="${STATE_DIR:?}/lock.pid" pid i=0
+  local lock="${STATE_DIR:?}/lock.pid" brk="${STATE_DIR:?}/lock.break" pid i=0
   until ln -s "$$" "$lock" 2>/dev/null; do
     i=$((i + 1))
     [ "$i" -le 300 ] || die "busy: another wgctl call holds $lock"
-    pid=$(readlink "$lock" 2>/dev/null || true)
-    if [[ ! $pid =~ ^[0-9]+$ ]] || [ "$pid" = $$ ] || ! ps -p "$pid" -o args= 2>/dev/null | grep -q wgctl; then
-      rm -f "$lock"     # stale
+    # Only the holder of lock.break (held for milliseconds) may judge and remove a stale lock.pid, so
+    # two waiters can't both break it and one remove the lock the other just took.
+    if ln -s "$$" "$brk" 2>/dev/null; then
+      pid=$(readlink "$lock" 2>/dev/null || true)
+      if { [ -L "$lock" ] || [ -e "$lock" ]; } && ! lock_holder_alive "$pid"; then
+        rm -f "$lock" "$brk"
+        continue
+      fi
+      rm -f "$brk"
+    elif [ $(( $(date +%s) - $(stat -f %m "$brk" 2>/dev/null || date +%s) )) -gt 10 ]; then
+      rm -f "$brk"      # its holder died mid-break
       continue
     fi
     sleep 0.2
   done
-  trap 'rm -f "${STATE_DIR:?}/lock.pid"' EXIT
+  trap 'if [ "$(readlink "${STATE_DIR:?}/lock.pid")" = "$$" ]; then rm -f "${STATE_DIR:?}/lock.pid"; fi' EXIT
+}
+
+# True if pid $1 is another live wgctl running as root (a user process could only fake the name).
+lock_holder_alive() {
+  [[ $1 =~ ^[0-9]+$ ]] && [ "$1" != $$ ] \
+    && ps -p "$1" -o uid=,args= 2>/dev/null | awk '$1 == 0 && /wgctl/ { f = 1 } END { exit !f }'
 }
 
 # Prints config $1 with "Table = off" added right after the first [Interface] header and every
