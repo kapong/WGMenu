@@ -65,12 +65,17 @@ final class TunnelStore: ObservableObject {
     @Published var upInFlight: Set<String> = []          // names with a running `up` toggle
     @Published var rates: [String: Stats.Rate] = [:]     // per up tunnel, from the last two polls
     @Published private(set) var rxHealthy: Set<String> = []  // up tunnels passing Stats.rxHealth
+    @Published private(set) var offices = UserDefaults.standard.dictionary(forKey: officeKey) as? [String: [String]] ?? [:]  // tunnel name -> office gateway MACs
 
     private var refreshTask: Task<Void, Never>?
     private var timer: Timer?
     private var lastCounters: [String: Stats.Counters] = [:]
     private var lastSampleAt: UInt64 = 0                // CLOCK_MONOTONIC ns: counts through sleep
     private var lastRxChange: [String: UInt64] = [:]    // CLOCK_MONOTONIC ns of the last rx increase (up tunnels only)
+    private static let officeKey = "officeGatewayMACs"
+    private var watcher: NetworkWatcher?
+    private var gatewayTask: Task<Void, Never>?
+    private var lastGatewayMAC: String?                 // last resolved gateway MAC; nil until the first one
 
     var activeCount: Int { tunnels.filter(\.isUp).count }
 
@@ -87,6 +92,8 @@ final class TunnelStore: ObservableObject {
                 await self.refresh()
             }
         }
+        watcher = NetworkWatcher { [weak self] in Task { @MainActor in self?.checkGateway() } }
+        checkGateway()                                  // launching on an office network counts as arrival
     }
 
     // A poll already in flight may predate the caller's change, so wait for it, then poll anyway.
@@ -149,6 +156,68 @@ final class TunnelStore: ObservableObject {
             busy.remove(name)
             upInFlight.remove(name)
         }
+    }
+
+    // Office auto-off: when the gateway MAC changes to one a tunnel lists and that tunnel is up, take
+    // it down once. Same MAC again (manual re-enable), no gateway or no ARP entry: do nothing.
+    // A newer network change cancels a pending check.
+    private func checkGateway() {
+        gatewayTask?.cancel()
+        gatewayTask = Task {
+            var mac: String?
+            for attempt in 0..<5 {                      // ARP may not know the router yet right after joining
+                if attempt > 0 { try? await Task.sleep(nanoseconds: 1_000_000_000) }
+                guard !Task.isCancelled, let router = watcher?.router else { return }
+                mac = await Self.gatewayMAC(router)
+                if mac != nil { break }
+            }
+            guard let mac, mac != lastGatewayMAC else { return }
+            await refresh()                             // decide on fresh up/down state, not a 5 s old poll
+            guard !Task.isCancelled else { return }
+            let names = OfficeRules.toDisconnect(mac: mac, lastMAC: lastGatewayMAC, offices: offices,
+                                                 up: tunnels.filter(\.isUp).map(\.name))
+            lastGatewayMAC = mac
+            for t in tunnels where names.contains(t.name) { toggle(t) }
+        }
+    }
+
+    // `arp -n` needs no root. The IP is validated first so nothing else reaches arp's argv.
+    private static func gatewayMAC(_ router: String) async -> String? {
+        guard OfficeRules.isIPv4(router) else { return nil }
+        return await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .utility).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+                p.arguments = ["-n", router]
+                let o = Pipe()
+                p.standardOutput = o
+                p.standardError = FileHandle.nullDevice
+                guard (try? p.run()) != nil else { return cont.resume(returning: nil) }
+                let d = o.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                cont.resume(returning: OfficeRules.macFromArp(String(decoding: d, as: UTF8.self)))
+            }
+        }
+    }
+
+    func markOffice(_ t: Tunnel) {
+        let name = t.name
+        Task {
+            guard let router = watcher?.router, let mac = await Self.gatewayMAC(router) else {
+                NSApp.activate(ignoringOtherApps: true)
+                Self.alert("No gateway found", "Couldn't read the default gateway's MAC address. Connect to the office network and try again.")
+                return
+            }
+            setOffices(name, OfficeRules.adding(mac, to: offices[name] ?? []))
+            lastGatewayMAC = mac                        // already here: don't treat this network as a new arrival
+        }
+    }
+
+    func clearOffices(_ t: Tunnel) { setOffices(t.name, nil) }
+
+    private func setOffices(_ name: String, _ macs: [String]?) {
+        offices[name] = macs
+        UserDefaults.standard.set(offices, forKey: Self.officeKey)
     }
 
     func disconnectAll() {
@@ -312,6 +381,7 @@ final class TunnelStore: ObservableObject {
             if downOK {
                 if Self.privileged(ConfigImport.shellScript(cmd), failure: "Delete failed") != nil {
                     lastError = nil
+                    setOffices(name, nil)           // a re-import under this name starts without office rules
                 } else if wasUp {
                     lastError = "Delete did not complete; \(name) was disconnected"
                 }
@@ -410,6 +480,11 @@ struct TunnelRow: View {
                 // Deferred so the menu closes before a password prompt or alert goes modal.
                 Button("Edit…") { Task { @MainActor in store.edit(tunnel) } }
                 Button("Delete…") { Task { @MainActor in store.delete(tunnel) } }
+                Divider()
+                Button("Mark this network as office") { Task { @MainActor in store.markOffice(tunnel) } }
+                if let n = store.offices[tunnel.name]?.count {
+                    Button("Clear office networks (\(n))") { store.clearOffices(tunnel) }
+                }
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -418,7 +493,7 @@ struct TunnelRow: View {
             .fixedSize()
             .padding(.trailing, 8)                    // keep clicks off the adjacent switch
             .disabled(store.busy.contains(tunnel.name))
-            .help("Edit or delete \(tunnel.name)")
+            .help("Edit, delete or office networks for \(tunnel.name)")
             if store.busy.contains(tunnel.name) {
                 ProgressView().controlSize(.small)
             } else {
