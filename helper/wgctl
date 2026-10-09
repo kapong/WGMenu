@@ -1,6 +1,6 @@
 #!/bin/bash
 # wgctl — privileged helper for WGMenu. Installed root:wheel 755 at /usr/local/sbin/wgctl.
-# Usage: wgctl list | status | up NAME | down NAME
+# Usage: wgctl list | status | routes NAME | up NAME | down NAME
 # Bash 3.2 compatible (macOS /bin/bash).
 set -euo pipefail
 # Runs as root via NOPASSWD sudo, so everything it executes must be root-owned.
@@ -87,10 +87,28 @@ status() {
   done < <(list_names)
 }
 
+# Prints only "allowedips <value>" ([Peer]) and "dns <value>" ([Interface]) lines of tunnel NAME,
+# never keys or anything else, so WGMenu can check route conflicts before `up` without a password.
+# Parsed like wg-quick: comments after "#" dropped, section and key case-insensitive, trimmed.
+routes() {
+  [ ! -L "$CONF_DIR/$1.conf" ] || die "refusing: $1.conf is a symlink"
+  awk '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    {
+      gsub(/\r/, ""); sub(/#.*/, ""); line = trim($0)
+      if (line ~ /^\[.*\]$/) { sec = tolower(trim(substr(line, 2, length(line) - 2))); next }
+      i = index(line, "="); if (!i) next
+      key = tolower(trim(substr(line, 1, i - 1))); val = trim(substr(line, i + 1))
+      if (sec == "peer" && key == "allowedips") print "allowedips " val
+      else if (sec == "interface" && key == "dns") print "dns " val
+    }' "$CONF_DIR/$1.conf"
+}
+
 cmd=${1:-}
 case "$cmd" in
   list)   list_names ;;
   status) status ;;
+  routes) check_name "${2:-}"; routes "$2" ;;
   up)
     check_name "${2:-}"
     if iface_of "$2" >/dev/null; then echo "$2 already up"; exit 0; fi
@@ -101,5 +119,5 @@ case "$cmd" in
     if ! iface_of "$2" >/dev/null; then echo "$2 already down"; exit 0; fi
     wg_quick down "$CONF_DIR/$2.conf"
     ;;
-  *) die "usage: wgctl list | status | up NAME | down NAME" ;;
+  *) die "usage: wgctl list | status | routes NAME | up NAME | down NAME" ;;
 esac

@@ -47,7 +47,7 @@ brew upgrade wgmenu
 sudo wgmenu-setup
 ```
 
-Also re-run `sudo wgmenu-setup` after upgrading `wireguard-tools`, `wireguard-go` or `bash`: it refreshes the root-owned copies of those tools. Quit and reopen WGMenu after an upgrade; if **Launch at login** stops working, turn it off and on again.
+Also re-run `sudo wgmenu-setup` after upgrading `wireguard-tools`, `wireguard-go` or `bash`: it refreshes the root-owned copies of those tools. Upgrading WGMenu itself also needs it, to install the updated helper (if the helper is older than the app, WGMenu says it can't check for conflicts before connecting). Quit and reopen WGMenu after an upgrade; if **Launch at login** stops working, turn it off and on again.
 
 ## Uninstall
 
@@ -74,7 +74,7 @@ sudo ./wgmenu-setup   # copies the app to /Applications
 
 WireGuard needs root to bring tunnels up. WGMenu keeps that surface small:
 
-- **Narrow root helper.** `wgmenu-setup` installs `/usr/local/sbin/wgctl` (root-owned) and a sudoers rule that lets your user run only that helper without a password. The helper does four things: `list`, `status`, `up NAME`, `down NAME`. Names are validated and must match a config in `/etc/wireguard`.
+- **Narrow root helper.** `wgmenu-setup` installs `/usr/local/sbin/wgctl` (root-owned) and a sudoers rule that lets your user run only that helper without a password. The helper does five things: `list`, `status`, `routes NAME`, `up NAME`, `down NAME`. Names are validated and must match a config in `/etc/wireguard`. `routes` prints only a tunnel's `AllowedIPs` and `DNS` values (never keys), so WGMenu can check for conflicts before connecting.
 - **No tools from user-writable paths.** `/opt/homebrew` is writable by your user, so the passwordless helper never runs anything from it. Setup copies `wg-quick`, `wg`, `wireguard-go` and `bash` (with its libraries) into root-owned `/usr/local/libexec/wgmenu`. Before every call, the helper checks that those files and their parent directories are root-owned and not writable by others, and runs them with a clean environment.
 - **Configs always need your password.** Configs hold private keys, and `wg-quick` runs their `PreUp`/`PostUp`/`PreDown`/`PostDown` lines as root. A passwordless write would be passwordless root, so reading, writing and deleting configs is never part of the helper. Import, Edit and Delete each ask for your admin password.
 - **Hook warning.** If a config contains `PreUp`/`PostUp`/`PreDown`/`PostDown`, WGMenu warns that those commands run as root and asks you to confirm before saving it.
@@ -86,6 +86,7 @@ WireGuard needs root to bring tunnels up. WGMenu keeps that surface small:
 - Tunnels must not have overlapping `AllowedIPs`.
 - Only one tunnel may route `0.0.0.0/0` (full tunnel).
 - Set `DNS` in at most one config.
+- WGMenu checks these for you: Import and Save warn about a full tunnel (`0.0.0.0/0` or `::/0`) and suggest the VPN subnet instead, and every connect warns when the tunnel overlaps a connected one, both are full tunnels, or both set `DNS`.
 - Don't run the same tunnel in the official WireGuard app at the same time.
 - An idle tunnel without keepalives receives nothing and turns orange after 3 minutes. Add `PersistentKeepalive = 25` to its `[Peer]` section to keep it green.
 - macOS may ask you to approve WGMenu under System Settings > General > Login Items.

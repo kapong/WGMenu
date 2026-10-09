@@ -7,6 +7,7 @@ import SwiftUI
 // toolchain @State expands to a macro whose plugin isn't shipped.
 struct ConfigForm: View {
     @Binding var text: String
+    @Binding var scrollTo: String?   // field id "\(section)-\(key)"; cleared once scrolled there
 
     static let interfaceKeys = ["Address", "DNS", "MTU", "ListenPort", "PrivateKey"]
     static let peerKeys = ["PublicKey", "Endpoint", "AllowedIPs", "PersistentKeepalive", "PresharedKey"]
@@ -15,35 +16,57 @@ struct ConfigForm: View {
 
     var body: some View {
         let cfg = WGConfig(text)
-        Form {
-            if cfg.sections.isEmpty {
-                Text("No [Interface] or [Peer] section found. Use Text mode.").foregroundStyle(.secondary)
-            }
-            ForEach(cfg.sections.indices, id: \.self) { s in
-                let sec = cfg.sections[s]
-                let keys = sec.name == "interface" ? Self.interfaceKeys : sec.name == "peer" ? Self.peerKeys : []
-                Section(title(cfg, s)) {
-                    ForEach(keys, id: \.self) { key in
-                        KnownField(text: $text, section: s, key: key, secret: Self.secretKeys.contains(key.lowercased()))
-                    }
-                    // Repeated or unlisted keys (hooks, Table, typos…): one row per line.
-                    ForEach(sec.entries.filter { !keys.map { $0.lowercased() }.contains($0.key.lowercased()) }, id: \.line) { e in
-                        HStack {
-                            LiveField(label: e.key, value: e.value, secret: Self.secretKeys.contains(e.key.lowercased())) { v in
-                                update { $0.setLine(e.line, value: v) }
+        ScrollViewReader { proxy in
+            Form {
+                if cfg.sections.isEmpty {
+                    Text("No [Interface] or [Peer] section found. Use Text mode.").foregroundStyle(.secondary)
+                }
+                ForEach(cfg.sections.indices, id: \.self) { s in
+                    let sec = cfg.sections[s]
+                    let keys = sec.name == "interface" ? Self.interfaceKeys : sec.name == "peer" ? Self.peerKeys : []
+                    Section(title(cfg, s)) {
+                        ForEach(keys, id: \.self) { key in
+                            VStack(alignment: .leading, spacing: 4) {
+                                KnownField(text: $text, section: s, key: key, secret: Self.secretKeys.contains(key.lowercased()))
+                                if key == "AllowedIPs", RouteRules.isFullTunnel(cfg.values(key, in: s)) {
+                                    Label(RouteRules.fullTunnelWarning + " " + RouteRules.fullTunnelHint(addresses: cfg.addresses),
+                                          systemImage: "exclamationmark.triangle.fill")
+                                        .font(.caption).foregroundStyle(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
-                            Button { update { $0.removeLine(e.line) } } label: { Image(systemName: "minus.circle") }
-                                .buttonStyle(.borderless).help("Remove this line")
+                            .id("\(s)-\(key)")
+                        }
+                        // Repeated or unlisted keys (hooks, Table, typos…): one row per line.
+                        ForEach(sec.entries.filter { !keys.map { $0.lowercased() }.contains($0.key.lowercased()) }, id: \.line) { e in
+                            HStack {
+                                LiveField(label: e.key, value: e.value, secret: Self.secretKeys.contains(e.key.lowercased())) { v in
+                                    update { $0.setLine(e.line, value: v) }
+                                }
+                                Button { update { $0.removeLine(e.line) } } label: { Image(systemName: "minus.circle") }
+                                    .buttonStyle(.borderless).help("Remove this line")
+                            }
+                        }
+                        AddFieldRow(suggestions: sec.name == "interface" ? Self.moreInterfaceKeys : []) { k, v in
+                            update { $0.add(k, v, in: s) }
                         }
                     }
-                    AddFieldRow(suggestions: sec.name == "interface" ? Self.moreInterfaceKeys : []) { k, v in
-                        update { $0.add(k, v, in: s) }
-                    }
                 }
+                Button("Add Peer") { update { $0.addPeer() } }
             }
-            Button("Add Peer") { update { $0.addPeer() } }
+            .formStyle(.grouped)
+            .onAppear { scroll(proxy) }
+            .onChange(of: scrollTo) { _ in scroll(proxy) }
         }
-        .formStyle(.grouped)
+    }
+
+    // Deferred so the rows exist when switching from Text mode or opening the window.
+    private func scroll(_ proxy: ScrollViewProxy) {
+        guard let id = scrollTo else { return }
+        DispatchQueue.main.async {
+            withAnimation { proxy.scrollTo(id, anchor: .center) }
+            scrollTo = nil
+        }
     }
 
     private func title(_ cfg: WGConfig, _ s: Int) -> String {

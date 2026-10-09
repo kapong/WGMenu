@@ -150,12 +150,40 @@ final class TunnelStore: ObservableObject {
         busy.insert(name)
         if action == "up" { upInFlight.insert(name) }
         Task {
+            if action == "up", !(await routesOK(name)) {
+                busy.remove(name)
+                upInFlight.remove(name)
+                return
+            }
             let r = await Helper.runAsync([action, name])
             lastError = r.status == 0 ? nil : "\(action) \(name) failed: " + Self.explain(r)
             await refresh()
             busy.remove(name)
             upInFlight.remove(name)
         }
+    }
+
+    // Before every `up`: compare AllowedIPs/DNS with the tunnels already up (read through `wgctl routes`,
+    // which prints no keys). Asks every time, Cancel by default; no "don't ask again".
+    private func routesOK(_ name: String) async -> Bool {
+        await refresh()
+        let up = tunnels.filter { $0.isUp && $0.name != name }.map(\.name)
+        guard !up.isEmpty else { return true }
+        var routes: [String: RouteRules.Routes] = [:]
+        for n in [name] + up {
+            let r = await Helper.runAsync(["routes", n])
+            guard r.status == 0 else {
+                NSApp.activate(ignoringOtherApps: true)
+                return Self.confirm("Connect \(name)?", "Can't check for conflicts — re-run wgmenu-setup to update the helper.", ok: "Continue")
+            }
+            routes[n] = RouteRules.parseRoutes(r.out)
+        }
+        let issues = RouteRules.conflicts(routes[name]!, with: up.map { ($0, routes[$0]!) })
+        guard !issues.isEmpty else { return true }
+        NSApp.activate(ignoringOtherApps: true)
+        return Self.confirm("\(name) conflicts with a connected tunnel",
+                            issues.map { "• " + $0 }.joined(separator: "\n") + "\n\nConnecting may break traffic of either tunnel.",
+                            ok: "Continue")
     }
 
     // Office auto-off: when the gateway MAC changes to one a tunnel lists and that tunnel is up, take
@@ -274,13 +302,23 @@ final class TunnelStore: ObservableObject {
                 continue
             }
             let data = try? Data(contentsOf: url)
-            guard let data, Self.vet(String(data: data, encoding: .utf8), rejected: "Skipped \(url.lastPathComponent)",
-                                     name: name, ok: "Import Anyway") else { continue }
+            let text = data.flatMap { String(data: $0, encoding: .utf8) }
+            guard let data, let text, Self.vet(text, rejected: "Skipped \(url.lastPathComponent)",
+                                               name: name, ok: "Import Anyway") else { continue }
             let replace = existing.contains(name)
             if replace, !Self.confirm(
                 "Replace \(name)?", "/etc/wireguard/\(name).conf already exists and will be overwritten.\n"
                     + "If the tunnel is up, it will later be stopped with the new config's PreDown/PostDown.",
                 ok: "Replace") { continue }
+            // Edit AllowedIPs: finish this file in the editor instead; its Save installs it.
+            guard Self.keepFullTunnel(name, text) else {
+                if EditorWindow.isOpen(name) {
+                    Self.alert("Skipped \(url.lastPathComponent)", "An editor for \(name) is already open. Close it and import again.")
+                } else {
+                    EditorWindow.open(name: name, text: text, store: self, importing: replace)
+                }
+                continue
+            }
             accepted.append((name, data, replace))
         }
         guard !accepted.isEmpty else { return }
@@ -299,6 +337,21 @@ final class TunnelStore: ObservableObject {
             "\(name) runs commands as root",
             "This config has PreUp/PostUp/PreDown/PostDown lines. wg-quick runs them as root every time the tunnel goes up or down. Continue only if you trust and have read this config.",
             ok: ok)
+    }
+
+    // Import and Save: a /0 in any peer's AllowedIPs gets a warning. true = proceed (not a full tunnel,
+    // or Keep full tunnel); false = the user chose Edit AllowedIPs.
+    static func keepFullTunnel(_ name: String, _ text: String) -> Bool {
+        let cfg = WGConfig(text)
+        guard RouteRules.isFullTunnel(cfg.allowedIPs.flatMap { $0 }) else { return true }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = RouteRules.fullTunnelWarning
+        a.informativeText = "\(name) has AllowedIPs 0.0.0.0/0 or ::/0, so it takes every connection and clashes with any other tunnel.\n\n"
+            + RouteRules.fullTunnelHint(addresses: cfg.addresses)
+        a.addButton(withTitle: "Keep full tunnel")
+        a.addButton(withTitle: "Edit AllowedIPs")
+        return a.runModal() == .alertFirstButtonReturn
     }
 
     // Shared by Import and Edit: write exactly the validated bytes into a private temp dir (0700/0600,
@@ -349,11 +402,12 @@ final class TunnelStore: ObservableObject {
     }
 
     // Returns true when the editor may close (saved, or nothing changed).
-    func save(name: String, original: String, edited: String) -> Bool {
+    // `replace` is false for a new file finished from Import (never overwrite an existing config).
+    func save(name: String, original: String, edited: String, replace: Bool = true) -> Bool {
         guard edited != original else { return true }
         guard ConfigImport.isValidName(name),
               Self.vet(edited, rejected: "Not saved", name: name, ok: "Save Anyway"),
-              install([(name, Data(edited.utf8), true)], failure: "Save failed") else { return false }
+              install([(name, Data(edited.utf8), replace)], failure: "Save failed") else { return false }
         if tunnels.contains(where: { $0.name == name && $0.isUp }) || busy.contains(name) {
             Self.alert("Saved \(name)", "Reconnect to apply: the tunnel may be up and still uses the old config.")
         }
@@ -601,7 +655,16 @@ final class EditorModel: ObservableObject {
     var original: String
     @Published var text: String
     @Published var formMode = true   // both modes edit `text`, so switching never loses data
+    @Published var scrollTo: String?  // ConfigForm field id to bring into view
     init(text: String) { original = text; self.text = text }
+
+    // Form mode, scrolled to the first peer whose AllowedIPs is a full tunnel.
+    func showAllowedIPs() {
+        let cfg = WGConfig(text)
+        guard let s = cfg.peers.first(where: { RouteRules.isFullTunnel(cfg.values("AllowedIPs", in: $0)) }) else { return }
+        formMode = true
+        scrollTo = "\(s)-AllowedIPs"
+    }
 }
 
 struct EditorView: View {
@@ -617,7 +680,7 @@ struct EditorView: View {
             }
             .pickerStyle(.segmented).labelsHidden().fixedSize()
             .frame(maxWidth: .infinity)
-            if model.formMode { ConfigForm(text: $model.text) } else { ConfigTextView(text: $model.text) }
+            if model.formMode { ConfigForm(text: $model.text, scrollTo: $model.scrollTo) } else { ConfigTextView(text: $model.text) }
             HStack {
                 Text("Saving asks for your password. Reconnect an up tunnel to apply.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -648,23 +711,30 @@ final class EditorWindow: NSObject, NSWindowDelegate {
         return true
     }
 
-    static func open(name: String, text: String, store: TunnelStore) {
+    static func isOpen(_ name: String) -> Bool { windows[name] != nil }
+
+    // `importing` (the replace flag) opens a not-yet-installed config from Import: Save installs it.
+    static func open(name: String, text: String, store: TunnelStore, importing: Bool? = nil) {
         guard !focus(name) else { return }
-        let w = EditorWindow(name: name, text: text, store: store)
+        let w = EditorWindow(name: name, text: text, store: store, importing: importing)
         windows[name] = w
         NSApp.activate(ignoringOtherApps: true)
         w.window.center()
         w.window.makeKeyAndOrderFront(nil)
     }
 
-    private init(name: String, text: String, store: TunnelStore) {
+    private init(name: String, text: String, store: TunnelStore, importing: Bool?) {
         self.name = name
         model = EditorModel(text: text)
+        if importing != nil {
+            model.original = ""        // nothing installed yet, so Save always installs
+            model.showAllowedIPs()
+        }
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 560),
                           styleMask: [.titled, .closable, .resizable, .miniaturizable],
                           backing: .buffered, defer: false)
         super.init()
-        window.title = "Edit \(name) — /etc/wireguard/\(name).conf"
+        window.title = "\(importing == nil ? "Edit" : "Import") \(name) — /etc/wireguard/\(name).conf"
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.delegate = self
@@ -682,7 +752,13 @@ final class EditorWindow: NSObject, NSWindowDelegate {
         window.contentView = NSHostingView(rootView: EditorView(
             model: model,
             save: { [weak self] in
-                if store.save(name: name, original: model.original, edited: model.text) { self?.closeLater() }
+                // Edit AllowedIPs: stay open, in Form mode at that field.
+                guard model.text == model.original || TunnelStore.keepFullTunnel(name, model.text) else {
+                    return model.showAllowedIPs()
+                }
+                if store.save(name: name, original: model.original, edited: model.text, replace: importing ?? true) {
+                    self?.closeLater()
+                }
             },
             cancel: { [weak self] in self?.closeLater() }))
     }
