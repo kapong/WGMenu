@@ -381,6 +381,7 @@ final class TunnelStore: ObservableObject {
             if downOK {
                 if Self.privileged(ConfigImport.shellScript(cmd), failure: "Delete failed") != nil {
                     lastError = nil
+                    setOffices(name, nil)           // a re-import under this name starts without office rules
                 } else if wasUp {
                     lastError = "Delete did not complete; \(name) was disconnected"
                 }
