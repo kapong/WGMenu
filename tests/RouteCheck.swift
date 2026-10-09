@@ -80,6 +80,58 @@ enum RouteCheck {
         let v6 = RouteRules.conflicts(.init(allowedIPs: ["fd00:1::/32"]), with: [("x", .init(allowedIPs: ["fd00::/16"]))])
         check(v6 == ["AllowedIPs overlap with x: fd00:1::/32 ↔ fd00::/16"], "v6 conflict: \(v6)")
 
+        // Subtraction.
+        func sub(_ a: String, _ b: String) -> [String] { RouteRules.subtract(cidr(a), cidr(b)).map(\.description) }
+        check(sub("10.1.0.0/16", "10.2.0.0/16") == ["10.1.0.0/16"], "disjoint")
+        check(sub("10.1.0.0/16", "10.0.0.0/8").isEmpty, "contained")
+        check(sub("10.1.0.0/16", "10.1.0.0/16").isEmpty, "equal")
+        check(sub("10.0.0.0/8", "10.128.0.0/9") == ["10.0.0.0/9"], "half")
+        check(sub("10.0.0.0/8", "10.1.0.0/16") == ["10.128.0.0/9", "10.64.0.0/10", "10.32.0.0/11", "10.16.0.0/12",
+                                                    "10.8.0.0/13", "10.4.0.0/14", "10.2.0.0/15", "10.0.0.0/16"], "containing")
+        let deep = RouteRules.subtract(cidr("10.0.0.0/8"), cidr("10.1.2.3"))
+        check(deep.count == 24 && deep.last?.description == "10.1.2.2/32" && deep.allSatisfy { !$0.overlaps(cidr("10.1.2.3")) },
+              "nested deep: \(deep)")
+        check(sub("10.1.2.3/32", "10.1.2.3/32").isEmpty && sub("10.1.2.3", "10.1.2.4") == ["10.1.2.3/32"], "/32")
+        check(sub("0.0.0.0/0", "0.0.0.0/0").isEmpty && sub("0.0.0.0/0", "128.0.0.0/1") == ["0.0.0.0/1"], "/0")
+        check(sub("10.0.0.0/8", "fd00::/8") == ["10.0.0.0/8"], "families never subtract")
+        check(sub("fd00::/16", "fd00:8000::/17") == ["fd00::/17"] && sub("::/0", "fd00::/8").count == 8, "v6")
+        let list = RouteRules.subtract([cidr("10.0.0.0/8"), cidr("192.168.0.0/16")],
+                                       minus: [cidr("10.0.0.0/9"), cidr("10.192.0.0/10"), cidr("192.168.0.0/16")])
+        check(list.map(\.description) == ["10.128.0.0/10"], "list: \(list)")
+        // Sizes add up: a /8 minus one host leaves 2^24 - 1 addresses.
+        let total = deep.reduce(0) { $0 + (1 << (32 - $1.prefix)) }
+        check(total == (1 << 24) - 1, "deep sizes: \(total)")
+
+        // Route plan.
+        func plan(_ t: [(String, [String])]) -> [String] {
+            RouteRules.plan(t.map { (name: $0.0, allowedIPs: $0.1) }).map { "\($0.name): " + $0.routes.map(\.description).joined(separator: " ") }
+        }
+        check(plan([("high", ["10.1.0.0/16"]), ("low", ["10.0.0.0/8"])]) == [
+            "high: 10.1.0.0/16",
+            "low: 10.0.0.0/16 10.2.0.0/15 10.4.0.0/14 10.8.0.0/13 10.16.0.0/12 10.32.0.0/11 10.64.0.0/10 10.128.0.0/9"],
+              "issue example")
+        check(plan([("a", ["10.1.0.0/16"]), ("b", ["10.1.0.0/16", "192.168.1.0/24"])]) == ["a: 10.1.0.0/16", "b: 192.168.1.0/24"],
+              "equal prefixes: lower loses")
+        check(plan([("a", ["10.1.0.0/16"]), ("b", ["10.1.0.0/16"])]) == ["a: 10.1.0.0/16", "b: "], "lower gets nothing")
+        let fullLow = plan([("office", ["10.1.0.0/16", "fd00::/16"]), ("vpn", ["0.0.0.0/0", "::/0"])])
+        check(fullLow[0] == "office: 10.1.0.0/16 fd00::/16", "split high: \(fullLow)")
+        let vpn = RouteRules.plan([(name: "office", allowedIPs: ["10.1.0.0/16"]), (name: "vpn", allowedIPs: ["0.0.0.0/0", "::/0"])])[1].routes
+        check(vpn.count == 16 + 2 && !vpn.contains { $0.prefix == 0 } && vpn.allSatisfy { !$0.overlaps(cidr("10.1.0.0/16")) }
+              && vpn.filter { $0.bytes.count == 16 }.map(\.description) == ["::/1", "8000::/1"], "full-tunnel low: \(vpn)")
+        check(plan([("vpn", ["0.0.0.0/0"]), ("office", ["10.1.0.0/16"])]) == ["vpn: 0.0.0.0/1 128.0.0.0/1", "office: "],
+              "full-tunnel high takes all")
+        check(plan([("a", ["garbage", "10.1.2.3/24", "10.1.2.0/24", "10.1.2.128/25"])]) == ["a: 10.1.2.0/24"], "canonical, skips garbage")
+        check(plan([]).isEmpty, "no tunnels")
+
+        // DNS owner.
+        check(RouteRules.dnsOwner([("a", false), ("b", true), ("c", true)]) == "b", "dns owner")
+        check(RouteRules.dnsOwner([("a", false)]) == nil && RouteRules.dnsOwner([]) == nil, "no dns owner")
+
+        // Priority order.
+        check(RouteRules.ordered(["a", "b", "c", "d"], priority: ["c", "x", "a"]) == ["c", "a", "b", "d"], "ordered")
+        check(RouteRules.ordered(["b", "a"], priority: []) == ["b", "a"], "unlisted keep order")
+        check(RouteRules.ordered(["a", "b"], priority: ["b", "a", "b"]) == ["b", "a"], "duplicate in list")
+
         print("RouteCheck: all passed")
     }
 }

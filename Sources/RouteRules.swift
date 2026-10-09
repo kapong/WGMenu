@@ -3,7 +3,7 @@ import Foundation
 // Pure AllowedIPs/DNS checks (Foundation only, so tests/RouteCheck.swift can compile it alone).
 enum RouteRules {
     // An IPv4 (4 bytes) or IPv6 (16 bytes) prefix. `bytes` is the address as written.
-    struct CIDR: Equatable, CustomStringConvertible {
+    struct CIDR: Hashable, CustomStringConvertible {
         let bytes: [UInt8]
         let prefix: Int
 
@@ -30,6 +30,64 @@ enum RouteRules {
             guard inet_ntop(family, &net, &buf, socklen_t(buf.count)) != nil else { return "?" }
             return "\(String(cString: buf))/\(prefix)"
         }
+    }
+
+    // a minus b as the fewest prefixes: disjoint -> [a]; b covers a -> []; otherwise, walking from a
+    // down to b, the sibling of b's path at each level (largest first). Results are normalized.
+    static func subtract(_ a: CIDR, _ b: CIDR) -> [CIDR] {
+        guard a.overlaps(b) else { return [a] }
+        guard !b.contains(a) else { return [] }
+        return (a.prefix + 1...b.prefix).map { p in
+            var bytes = CIDR(bytes: b.bytes, prefix: p).network
+            bytes[(p - 1) / 8] ^= 0x80 >> ((p - 1) % 8)
+            return CIDR(bytes: bytes, prefix: p)
+        }
+    }
+
+    static func subtract(_ a: [CIDR], minus b: [CIDR]) -> [CIDR] {
+        b.reduce(a) { rest, x in rest.flatMap { subtract($0, x) } }
+    }
+
+    // Normalized, without duplicates or prefixes covered by another; IPv4 first, then by address.
+    static func canonical(_ cidrs: [CIDR]) -> [CIDR] {
+        let u = Set(cidrs.map { CIDR(bytes: $0.network, prefix: $0.prefix) })
+        return u.filter { c in !u.contains { $0 != c && $0.contains(c) } }.sorted {
+            $0.bytes.count != $1.bytes.count ? $0.bytes.count < $1.bytes.count
+                : $0.bytes != $1.bytes ? $0.bytes.lexicographicallyPrecedes($1.bytes) : $0.prefix < $1.prefix
+        }
+    }
+
+    // macOS already has a /0 default route, so a /0 is routed as its two /1 halves.
+    static func splitDefault(_ c: CIDR) -> [CIDR] {
+        guard c.prefix == 0 else { return [c] }
+        let zero = [UInt8](repeating: 0, count: c.bytes.count)
+        var high = zero
+        high[0] = 0x80
+        return [CIDR(bytes: zero, prefix: 1), CIDR(bytes: high, prefix: 1)]
+    }
+
+    // Up tunnels in priority order (highest first) -> the routes each one gets: its AllowedIPs minus
+    // everything a higher tunnel claims. Unparsable entries are skipped; each list is canonical.
+    static func plan(_ tunnels: [(name: String, allowedIPs: [String])]) -> [(name: String, routes: [CIDR])] {
+        var higher: [CIDR] = []
+        return tunnels.map { t in
+            let mine = t.allowedIPs.compactMap(parse).flatMap(splitDefault)
+            defer { higher += mine }
+            return (t.name, canonical(subtract(mine, minus: higher)))
+        }
+    }
+
+    // The highest-priority up tunnel that sets DNS.
+    static func dnsOwner(_ tunnels: [(name: String, hasDNS: Bool)]) -> String? {
+        tunnels.first(where: \.hasDNS)?.name
+    }
+
+    // Names in priority order: listed ones first in list order, the rest after in their given order.
+    static func ordered(_ names: [String], priority: [String]) -> [String] {
+        let rank = Dictionary(priority.enumerated().map { ($1, $0) }, uniquingKeysWith: min)
+        return names.enumerated().sorted {
+            (rank[$0.element] ?? priority.count, $0.offset) < (rank[$1.element] ?? priority.count, $1.offset)
+        }.map(\.element)
     }
 
     // "10.1.0.0/16", "fd00::/64"; a bare address is a single host (/32 or /128). nil if invalid.

@@ -66,6 +66,7 @@ final class TunnelStore: ObservableObject {
     @Published var rates: [String: Stats.Rate] = [:]     // per up tunnel, from the last two polls
     @Published private(set) var rxHealthy: Set<String> = []  // up tunnels passing Stats.rxHealth
     @Published private(set) var offices = UserDefaults.standard.dictionary(forKey: officeKey) as? [String: [String]] ?? [:]  // tunnel name -> office gateway MACs
+    @Published private(set) var priority = UserDefaults.standard.stringArray(forKey: priorityKey) ?? []  // tunnel names, highest first
 
     private var refreshTask: Task<Void, Never>?
     private var timer: Timer?
@@ -73,11 +74,18 @@ final class TunnelStore: ObservableObject {
     private var lastSampleAt: UInt64 = 0                // CLOCK_MONOTONIC ns: counts through sleep
     private var lastRxChange: [String: UInt64] = [:]    // CLOCK_MONOTONIC ns of the last rx increase (up tunnels only)
     private static let officeKey = "officeGatewayMACs"
+    private static let priorityKey = "tunnelPriority"
     private var watcher: NetworkWatcher?
     private var gatewayTask: Task<Void, Never>?
     private var lastGatewayMAC: String?                 // last resolved gateway MAC; nil until the first one
 
     var activeCount: Int { tunnels.filter(\.isUp).count }
+
+    // Tunnels in priority order (highest first); ones not in `priority` follow in status order.
+    var ordered: [Tunnel] {
+        let byName = Dictionary(tunnels.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+        return RouteRules.ordered(tunnels.map(\.name), priority: priority).compactMap { byName[$0] }
+    }
 
     var health: Stats.Health {
         Stats.health(healthy: tunnels.filter(\.isUp).map { rxHealthy.contains($0.name) },
@@ -249,6 +257,27 @@ final class TunnelStore: ObservableObject {
     private func setOffices(_ name: String, _ macs: [String]?) {
         offices[name] = macs
         UserDefaults.standard.set(offices, forKey: Self.officeKey)
+    }
+
+    // Swap with the neighbour above (-1) or below (+1) and store the whole displayed order.
+    func move(_ t: Tunnel, by offset: Int) {
+        var names = ordered.map(\.name)
+        guard let i = names.firstIndex(of: t.name), names.indices.contains(i + offset) else { return }
+        names.swapAt(i, i + offset)
+        setPriority(names)
+    }
+
+    private func setPriority(_ names: [String]) {
+        priority = names
+        UserDefaults.standard.set(names, forKey: Self.priorityKey)
+    }
+
+    // For applying routes: `routes` holds the `wgctl routes` output of each tunnel that is (or is
+    // about to be) up. Returns each one's routes, highest priority first, and which one owns DNS.
+    func routePlan(_ routes: [String: RouteRules.Routes]) -> (routes: [(name: String, routes: [RouteRules.CIDR])], dnsOwner: String?) {
+        let up = RouteRules.ordered(routes.keys.sorted(), priority: ordered.map(\.name))
+        return (RouteRules.plan(up.map { ($0, routes[$0]!.allowedIPs) }),
+                RouteRules.dnsOwner(up.map { ($0, !routes[$0]!.dns.isEmpty) }))
     }
 
     func disconnectAll() {
@@ -440,6 +469,7 @@ final class TunnelStore: ObservableObject {
                 if Self.privileged(ConfigImport.shellScript(cmd), failure: "Delete failed") != nil {
                     lastError = nil
                     setOffices(name, nil)           // a re-import under this name starts without office rules
+                    setPriority(priority.filter { $0 != name })   // ... and at the bottom of the list
                 } else if wasUp {
                     lastError = "Delete did not complete; \(name) was disconnected"
                 }
@@ -539,6 +569,9 @@ struct TunnelRow: View {
                 Button("Edit…") { Task { @MainActor in store.edit(tunnel) } }
                 Button("Delete…") { Task { @MainActor in store.delete(tunnel) } }
                 Divider()
+                Button("Move Up") { store.move(tunnel, by: -1) }.disabled(store.ordered.first?.name == tunnel.name)
+                Button("Move Down") { store.move(tunnel, by: 1) }.disabled(store.ordered.last?.name == tunnel.name)
+                Divider()
                 Button("Mark this network as office") { Task { @MainActor in store.markOffice(tunnel) } }
                 if let n = store.offices[tunnel.name]?.count {
                     Button("Clear office networks (\(n))") { store.clearOffices(tunnel) }
@@ -551,7 +584,7 @@ struct TunnelRow: View {
             .fixedSize()
             .padding(.trailing, 8)                    // keep clicks off the adjacent switch
             .disabled(store.busy.contains(tunnel.name))
-            .help("Edit, delete or office networks for \(tunnel.name)")
+            .help("Edit, delete, priority or office networks for \(tunnel.name)")
             if store.busy.contains(tunnel.name) {
                 ProgressView().controlSize(.small)
             } else {
@@ -582,7 +615,7 @@ struct ContentView: View {
                 Text(store.loaded ? "No configs found in /etc/wireguard" : "Loading…")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(store.tunnels) { TunnelRow(tunnel: $0) }
+                ForEach(store.ordered) { TunnelRow(tunnel: $0) }   // top = highest priority
             }
 
             if let err = store.lastError {
