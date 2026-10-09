@@ -70,6 +70,12 @@ final class TunnelStore: ObservableObject {
     @Published var lastError: String?
     @Published var loaded = false
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var showIsland = UserDefaults.standard.bool(forKey: islandKey) {  // opt-in top-centre overlay
+        didSet {
+            UserDefaults.standard.set(showIsland, forKey: Self.islandKey)
+            Task { @MainActor in Island.sync(self) }    // deferred: the toggle may sit in the panel it closes
+        }
+    }
     @Published var upInFlight: Set<String> = []          // names with a running `up` toggle
     @Published var rates: [String: Stats.Rate] = [:]     // per up tunnel, from the last two polls
     @Published private(set) var rxHealthy: Set<String> = []  // up tunnels passing Stats.rxHealth
@@ -83,6 +89,7 @@ final class TunnelStore: ObservableObject {
     private var lastRxChange: [String: UInt64] = [:]    // CLOCK_MONOTONIC ns of the last rx increase (up tunnels only)
     private static let officeKey = "officeGatewayMACs"
     private static let priorityKey = "tunnelPriority"
+    private static let islandKey = "showIsland"
     private var watcher: NetworkWatcher?
     private var gatewayTask: Task<Void, Never>?
     private var lastGatewayMAC: String?                 // last resolved gateway MAC; nil until the first one
@@ -109,6 +116,11 @@ final class TunnelStore: ObservableObject {
                      upInFlight: !upInFlight.isEmpty)
     }
 
+    // One tunnel's state: the row dot and the island's dots.
+    func health(of t: Tunnel) -> Stats.Health {
+        Stats.health(healthy: t.isUp ? [rxHealthy.contains(t.name)] : [], upInFlight: upInFlight.contains(t.name))
+    }
+
     init() {
         // Crash recovery: polls right away, then applies the current plan, which drops routes (and
         // copies) of tunnels no longer up and restores those of tunnels WGMenu brought up before.
@@ -122,6 +134,7 @@ final class TunnelStore: ObservableObject {
         // New network: office check, and routes again (a full tunnel's endpoint route follows the gateway).
         watcher = NetworkWatcher { [weak self] in Task { @MainActor in self?.checkGateway(); self?.applyRoutes() } }
         checkGateway()                                  // launching on an office network counts as arrival
+        Task { @MainActor in Island.sync(self) }        // after launch finishes: the panel needs NSApp up
     }
 
     // A poll already in flight may predate the caller's change, so wait for it, then poll anyway.
@@ -679,7 +692,7 @@ struct TunnelRow: View {
     // Green: up + rx increased within Stats.rxWindow. Orange: up toggle in flight, or up but nothing
     // received lately. Gray: down.
     private var color: Color {
-        switch Stats.health(healthy: tunnel.isUp ? [store.rxHealthy.contains(tunnel.name)] : [], upInFlight: store.upInFlight.contains(tunnel.name)) {
+        switch store.health(of: tunnel) {
         case .off: return .gray
         case .connecting: return .orange
         case .ok: return .green
@@ -852,27 +865,38 @@ struct ContentView: View {
                 }
             }
 
-            if let err = store.lastError {
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Divider()
-            Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin },
-                                                    set: { store.setLaunchAtLogin($0) }))
-            HStack {
-                Button("Disconnect All") { store.disconnectAll() }
-                    .disabled(store.activeCount == 0)
-                Button("Import Config…") { store.importConfigs() }
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-            }
+            MenuFooter()
         }
         .padding(12)
         .frame(width: 340)
+    }
+}
+
+// Last error, settings and app actions: the bottom of the menu, and of the expanded island (which
+// replaces the menu while it is on, so it must offer the way back).
+struct MenuFooter: View {
+    @EnvironmentObject var store: TunnelStore
+
+    var body: some View {
+        if let err = store.lastError {
+            Text(err)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        Divider()
+        Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin },
+                                                set: { store.setLaunchAtLogin($0) }))
+        Toggle("Show island at top of screen", isOn: $store.showIsland)
+        HStack {
+            Button("Disconnect All") { store.disconnectAll() }
+                .disabled(store.activeCount == 0)
+            Button("Import Config…") { store.importConfigs() }
+            Spacer()
+            Button("Quit") { NSApplication.shared.terminate(nil) }
+        }
     }
 }
 
@@ -1057,7 +1081,11 @@ struct WGMenuApp: App {
     @StateObject private var store = TunnelStore()
 
     var body: some Scene {
-        MenuBarExtra {
+        // The island replaces the status item while on; turning it off (from the island) brings it back.
+        // SwiftUI writes isInserted back with the same value on every update; only a real change may publish,
+        // or each write-back re-renders the scene and the app spins.
+        MenuBarExtra(isInserted: Binding(get: { !store.showIsland },
+                                         set: { if store.showIsland == $0 { store.showIsland = !$0 } })) {
             ContentView().environmentObject(store)
         } label: {
             Image(nsImage: MenuBarLabel.image(health: store.health, count: store.activeCount,
