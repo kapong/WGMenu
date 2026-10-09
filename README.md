@@ -19,6 +19,7 @@ A macOS menu-bar app that runs **multiple WireGuard tunnels at once**. The offic
 - **Live ↑/↓ speed** (total) next to the logo, refreshed every 5 s.
 - **Per-tunnel details**: status dot, speed, last handshake and transferred bytes.
 - **Import / Edit / Delete configs** from the menu. Each asks for your admin password.
+- **Office auto-off**: mark a network as office for a tunnel (tunnel menu); on arriving there, WGMenu turns that tunnel off once. Turn it back on and it stays on. The office is recognized by the default gateway's MAC address, so no location permission is needed.
 - **Launch at login**.
 
 ## Requirements
@@ -88,6 +89,7 @@ WireGuard needs root to bring tunnels up. WGMenu keeps that surface small:
 - Don't run the same tunnel in the official WireGuard app at the same time.
 - An idle tunnel without keepalives receives nothing and turns orange after 3 minutes. Add `PersistentKeepalive = 25` to its `[Peer]` section to keep it green.
 - macOS may ask you to approve WGMenu under System Settings > General > Login Items.
+- Office auto-off matches the gateway's MAC address. If the office router is replaced (or a mesh hands you a different access point as gateway), mark the network again. Anyone on the LAN who spoofs a marked gateway MAC can make WGMenu turn that tunnel off; it never turns tunnels on.
 
 ## License
 
