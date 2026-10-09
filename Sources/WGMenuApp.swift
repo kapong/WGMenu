@@ -87,6 +87,7 @@ final class TunnelStore: ObservableObject {
     private var lastGatewayMAC: String?                 // last resolved gateway MAC; nil until the first one
     private var applying = false                        // an applyRoutes() pass is running
     private var applyAgain = false                      // ... and another was asked for meanwhile
+    private var dnsApplied: [String: Bool] = [:]        // tunnels this run brought up -> DNS applied (no nodns)
 
     var activeCount: Int { tunnels.filter(\.isUp).count }
 
@@ -175,13 +176,19 @@ final class TunnelStore: ObservableObject {
                     upInFlight.remove(name)
                     return
                 }
-                // DNS follows priority: a higher tunnel that sets DNS keeps it.
-                if let owner = routePlan(routes).dnsOwner, owner != name { args.append("nodns") }
+                // DNS follows priority: a higher tunnel that sets DNS keeps it. Taking it over, lower
+                // holders drop theirs first (see moveDNS).
+                let owner = routePlan(routes).dnsOwner
+                if let owner, owner != name { args.append("nodns") }
+                if owner == name { for n in dnsHolders(routes, except: name) { await bounce(n, dns: false) } }
             }
             let r = await Helper.runAsync(args)
             lastError = r.status == 0 ? nil : "\(action) \(name) failed: " + Self.explain(r)
             await refresh()
-            if r.status == 0 { applyRoutes() }
+            if r.status == 0 {
+                dnsApplied[name] = action == "up" ? !args.contains("nodns") : nil
+                applyRoutes()
+            }
             busy.remove(name)
             upInFlight.remove(name)
         }
@@ -234,7 +241,6 @@ final class TunnelStore: ObservableObject {
     private func applyRoutesOnce() async {
         await refresh()
         let up = tunnels.filter(\.isUp).map(\.name)
-        guard !up.isEmpty else { return }               // `down` already removed its own routes
         var routes: [String: RouteRules.Routes] = [:]
         for n in up {
             let r = await Helper.runAsync(["routes", n])
@@ -242,9 +248,46 @@ final class TunnelStore: ObservableObject {
             guard r.status == 0 else { lastError = "Routes not applied: " + Self.explain(r); return }
             routes[n] = RouteRules.parseRoutes(r.out)
         }
-        let plan = routePlan(routes).routes.flatMap { t in t.routes.map { "\(t.name) \($0)\n" } }.joined()
+        let p = routePlan(routes)
+        // A prefix without a textual form ("?") is dropped: the helper would reject the whole plan for it.
+        let plan = p.routes.flatMap { t in t.routes.map(\.description).filter { $0 != "?" }.map { "\(t.name) \($0)\n" } }.joined()
         let r = await Helper.runAsync(["apply-routes"], stdin: plan)
         if r.status != 0 { lastError = "Routes not applied: " + Self.explain(r) }
+        await moveDNS(owner: p.dnsOwner, routes)
+    }
+
+    // DNS follows priority among the tunnels this run brought up (others are left alone). wg-quick only
+    // sets DNS at up and restores what it found then at down, so moving DNS means reconnecting: holders
+    // that aren't the owner first come back with nodns, then an owner that came up with nodns comes back
+    // with DNS. Bounced tunnels lost their routes, so another apply pass follows.
+    private func moveDNS(owner: String?, _ routes: [String: RouteRules.Routes]) async {
+        dnsApplied = dnsApplied.filter { routes[$0.key] != nil }   // forget tunnels no longer up
+        var bounced = false
+        for n in dnsHolders(routes, except: owner) { bounced = await bounce(n, dns: false) || bounced }
+        if let owner, dnsApplied[owner] == false { bounced = await bounce(owner, dns: true) || bounced }
+        if bounced { applyAgain = true }
+    }
+
+    // Tunnels this run brought up with DNS that set DNS, other than `except`.
+    private func dnsHolders(_ routes: [String: RouteRules.Routes], except: String?) -> [String] {
+        dnsApplied.filter { $0.value && $0.key != except && !(routes[$0.key]?.dns.isEmpty ?? true) }.keys.sorted()
+    }
+
+    // Internal reconnect to move DNS: no conflict prompt, no office check. Returns true if it went down.
+    @discardableResult
+    private func bounce(_ name: String, dns: Bool) async -> Bool {
+        guard !busy.contains(name) else { return false }
+        busy.insert(name)
+        defer { busy.remove(name) }
+        var r = await Helper.runAsync(["down", name])
+        let wentDown = r.status == 0
+        if wentDown {
+            dnsApplied[name] = nil
+            r = await Helper.runAsync(dns ? ["up", name] : ["up", name, "nodns"])
+            if r.status == 0 { dnsApplied[name] = dns }
+        }
+        if r.status != 0 { lastError = "Reconnecting \(name) to move DNS failed: " + Self.explain(r) }
+        return wentDown
     }
 
     // Office auto-off: when the gateway MAC changes to one a tunnel lists and that tunnel is up, take

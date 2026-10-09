@@ -52,8 +52,7 @@ run_clean() {
     WG_QUICK_USERSPACE_IMPLEMENTATION="$LIBEXEC/wireguard-go" "$@"
 }
 # wg-quick needs bash >= 4; run it with the root-owned bash copy (never its shebang).
-# fd 9 (the state lock) is closed for it: its backgrounded route monitor would hold the lock forever.
-wg_quick() { run_clean "$LIBEXEC/bash" "$LIBEXEC/wg-quick" "$@" 9>&-; }
+wg_quick() { run_clean "$LIBEXEC/bash" "$LIBEXEC/wg-quick" "$@"; }
 
 list_names() {
   local f n
@@ -110,8 +109,7 @@ routes() {
     }' "$CONF_DIR/$1.conf"
 }
 
-# Creates $STATE_DIR if needed, refuses anything but a root-owned 700 directory, and takes the lock
-# that serializes up, down and apply-routes (released when this process exits).
+# Creates $STATE_DIR if needed, refuses anything but a root-owned 700 directory, and takes the lock.
 prepare_state() {
   local uid mode
   [ ! -L "$STATE_DIR" ] || die "refusing: $STATE_DIR is a symlink"
@@ -119,8 +117,26 @@ prepare_state() {
   read -r uid mode <<< "$(/usr/bin/stat -f '%u %Lp' "$STATE_DIR")"
   [ "$uid" = 0 ] && [ "$mode" = 700 ] || die "refusing: $STATE_DIR must be root-owned with mode 700"
   umask 077
-  exec 9>>"$STATE_DIR/lock"
-  lockf -s -t 60 9 || die "busy: another wgctl call holds $STATE_DIR/lock"
+  lock_state
+}
+
+# Serializes up, down and apply-routes. The lock is a symlink naming the holder's pid: creating it is
+# atomic and carries the pid, so there is no half-made state. Removed on exit; a lock whose holder is
+# no longer a wgctl process (killed mid-call) is broken. Waits up to 60 s. Plain shell on purpose:
+# lockf(1) on macOS 13-15 can only wrap a whole command, not lock from inside a script.
+lock_state() {
+  local lock="${STATE_DIR:?}/lock.pid" pid i=0
+  until ln -s "$$" "$lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -le 300 ] || die "busy: another wgctl call holds $lock"
+    pid=$(readlink "$lock" 2>/dev/null || true)
+    if [[ ! $pid =~ ^[0-9]+$ ]] || [ "$pid" = $$ ] || ! ps -p "$pid" -o args= 2>/dev/null | grep -q wgctl; then
+      rm -f "$lock"     # stale
+      continue
+    fi
+    sleep 0.2
+  done
+  trap 'rm -f "${STATE_DIR:?}/lock.pid"' EXIT
 }
 
 # Prints config $1 with "Table = off" added right after the first [Interface] header and every
@@ -154,8 +170,9 @@ make_temp_conf() {
 V4_OCTET='(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])'
 valid_v4() { [[ $1 =~ ^$V4_OCTET(\.$V4_OCTET){3}$ ]]; }
 
-# IPv6: hex groups only, at most one "::", 8 groups without it and at most 7 with it. No embedded
-# IPv4, no zone. v6_side checks one side of "::" and sets V6_N to its group count.
+# IPv6: hex groups, at most one "::", 8 groups without it and at most 7 with it; a trailing dotted
+# quad (as inet_ntop writes ::ffff:1.2.3.4) counts as two groups. No zone. v6_side checks one side
+# of "::" and sets V6_N to its group count.
 v6_side() {
   local g
   V6_N=0
@@ -164,13 +181,17 @@ v6_side() {
   for g in ${1//:/ }; do [[ $g =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1; V6_N=$((V6_N + 1)); done
 }
 valid_v6() {
-  local n
-  [[ $1 =~ ^[0-9a-fA-F:]{2,39}$ && $1 != *:::* ]] || return 1
-  case $1 in
+  local s=$1 n
+  if [[ $s == *.* ]]; then
+    [[ $s == *:* ]] && valid_v4 "${s##*:}" || return 1
+    s=${s%:*}:0:0
+  fi
+  [[ $s =~ ^[0-9a-fA-F:]{2,39}$ && $s != *:::* ]] || return 1
+  case $s in
     *::*::*) return 1 ;;
-    *::*) v6_side "${1%%::*}" || return 1; n=$V6_N
-          v6_side "${1#*::}" || return 1; [ $((n + V6_N)) -le 7 ] ;;
-    *) v6_side "$1" && [ "$V6_N" -eq 8 ] ;;
+    *::*) v6_side "${s%%::*}" || return 1; n=$V6_N
+          v6_side "${s#*::}" || return 1; [ $((n + V6_N)) -le 7 ] ;;
+    *) v6_side "$s" && [ "$V6_N" -eq 8 ] ;;
   esac
 }
 
@@ -315,10 +336,11 @@ case "$cmd" in
   up)
     check_name "${2:-}"
     case "${3:-}" in ""|nodns) ;; *) die "usage: wgctl up NAME [nodns]" ;; esac
-    if iface_of "$2" >/dev/null; then echo "$2 already up"; exit 0; fi
     prepare_state
+    if iface_of "$2" >/dev/null; then echo "$2 already up"; exit 0; fi   # checked under the lock
     make_temp_conf "$2" "${3:-}"
-    wg_quick up "$STATE_DIR/$2.conf" || { rm -f "${STATE_DIR:?}/$2.conf"; exit 1; }
+    # Failed: drop the copy, unless the tunnel is up anyway (its copy is what makes it managed).
+    wg_quick up "$STATE_DIR/$2.conf" || { iface_of "$2" >/dev/null || rm -f "${STATE_DIR:?}/$2.conf"; exit 1; }
     ;;
   down)
     check_name "${2:-}"
