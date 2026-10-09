@@ -600,6 +600,7 @@ struct ConfigTextView: NSViewRepresentable {
 final class EditorModel: ObservableObject {
     var original: String
     @Published var text: String
+    @Published var formMode = true   // both modes edit `text`, so switching never loses data
     init(text: String) { original = text; self.text = text }
 }
 
@@ -610,7 +611,13 @@ struct EditorView: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 10) {
-            ConfigTextView(text: $model.text)
+            Picker("Mode", selection: $model.formMode) {
+                Text("Form").tag(true)
+                Text("Text").tag(false)
+            }
+            .pickerStyle(.segmented).labelsHidden().fixedSize()
+            .frame(maxWidth: .infinity)
+            if model.formMode { ConfigForm(text: $model.text) } else { ConfigTextView(text: $model.text) }
             HStack {
                 Text("Saving asks for your password. Reconnect an up tunnel to apply.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -620,7 +627,7 @@ struct EditorView: View {
             }
         }
         .padding(12)
-        .frame(minWidth: 520, minHeight: 360)
+        .frame(minWidth: 560, minHeight: 420)
     }
 }
 
@@ -652,7 +659,7 @@ final class EditorWindow: NSObject, NSWindowDelegate {
     private init(name: String, text: String, store: TunnelStore) {
         self.name = name
         model = EditorModel(text: text)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 440),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 560),
                           styleMask: [.titled, .closable, .resizable, .miniaturizable],
                           backing: .buffered, defer: false)
         super.init()
