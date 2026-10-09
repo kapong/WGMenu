@@ -638,6 +638,7 @@ final class EditorWindow: NSObject, NSWindowDelegate {
     private let name: String
     private let window: NSWindow
     private let model: EditorModel
+    private var fieldEditorObserver: NSObjectProtocol?
 
     // Brings an already-open editor forward (skips a second password prompt).
     static func focus(_ name: String) -> Bool {
@@ -667,6 +668,14 @@ final class EditorWindow: NSObject, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.delegate = self
+        // Form fields share the window's field editor: give it the same protections as ConfigTextView.
+        fieldEditorObserver = NotificationCenter.default.addObserver(
+            forName: NSTextView.didBeginEditingNotification, object: nil, queue: .main) { [weak window] n in
+            guard let tv = n.object as? NSTextView, tv.window === window else { return }
+            tv.isAutomaticTextReplacementEnabled = false
+            if #available(macOS 15, *) { tv.writingToolsBehavior = .none }
+            if #available(macOS 14, *) { tv.inlinePredictionType = .no }
+        }
         let model = model
         window.contentView = NSHostingView(rootView: EditorView(
             model: model,
@@ -682,6 +691,7 @@ final class EditorWindow: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let fieldEditorObserver { NotificationCenter.default.removeObserver(fieldEditorObserver) }
         model.text = ""
         model.original = ""
         window.contentView = nil

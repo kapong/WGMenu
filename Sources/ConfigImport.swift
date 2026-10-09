@@ -136,7 +136,7 @@ struct WGConfig {
     // MARK: Editing
 
     static func isValidKey(_ key: String) -> Bool {
-        !key.isEmpty && trim(key) == key && !key.contains { "=#[]\r\n".contains($0) }
+        !key.isEmpty && trim(key) == key && !key.contains { "=#[]\r\n\u{0}".contains($0) }
     }
 
     // Sets `key` in section `s`: rewrites the first line (dropping duplicates, see above), inserts a
@@ -147,13 +147,13 @@ struct WGConfig {
         guard Self.isValidKey(key), v != self.value(key, in: s) else { return }
         if let first = found.first, !v.isEmpty {
             lines[first.line] = Self.replacingValue(lines[first.line], with: v)
-            for e in found.dropFirst().reversed() { lines.remove(at: e.line) }
+            for e in found.dropFirst().reversed() { dropKeepingComment(e.line) }
         } else if found.isEmpty {
             let end = s + 1 < sections.count ? sections[s + 1].header : lines.count
             let at = hint.flatMap { (sections[s].header + 1...end).contains($0) ? $0 : nil } ?? insertionPoint(s)
             lines.insert("\(key) = \(v)\(eol)", at: at)
         } else {
-            for e in found.reversed() { lines.remove(at: e.line) }
+            for e in found.reversed() { dropKeepingComment(e.line) }
         }
         self = WGConfig(text)
     }
@@ -192,7 +192,15 @@ struct WGConfig {
 
     private static func trim<S: StringProtocol>(_ s: S) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    private static func oneLine(_ s: String) -> String { trim(s.components(separatedBy: .newlines).joined(separator: " ")) }
+    // One line, no NUL (looksLikeConfig rejects NUL; bash `read` would drop it).
+    private static func oneLine(_ s: String) -> String {
+        trim(s.components(separatedBy: .newlines).joined(separator: " ").replacingOccurrences(of: "\u{0}", with: ""))
+    }
+
+    // Removes a key/value line, but keeps an inline "# comment" on it as a comment-only line.
+    private mutating func dropKeepingComment(_ line: Int) {
+        if let hash = lines[line].firstIndex(of: "#") { lines[line] = String(lines[line][hash...]) } else { lines.remove(at: line) }
+    }
 
     // Swaps only the value text between "=" and any "#", keeping surrounding whitespace (and a "\r").
     private static func replacingValue(_ raw: String, with value: String) -> String {

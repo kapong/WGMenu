@@ -157,6 +157,11 @@ enum ImportCheck {
         l = lines0; l[9] = "AllowedIPs = 0.0.0.0/0"; l.remove(at: 10)
         check(c.text == l.joined(separator: "\n") && c.allowedIPs == [["0.0.0.0/0"]], "edit repeated key: first line rewritten, duplicates dropped")
 
+        c = WGConfig("[Interface]\nPrivateKey = k # main key\nDNS = 1.1.1.1\nDNS = 9.9.9.9 # backup\n")
+        c.set("PrivateKey", to: "", in: 0); c.set("DNS", to: "8.8.8.8", in: 0)
+        check(c.text == "[Interface]\n# main key\nDNS = 8.8.8.8\n# backup\n", "removed lines keep inline comments")
+        c = WGConfig("[Interface]\n"); c.set("MTU", to: "14\u{0}20", in: 0); c.add("Post\u{0}Up", "x", in: 0)
+        check(c.text == "[Interface]\nMTU = 1420\n" && !WGConfig.isValidKey("Post\u{0}Up"), "NUL stripped from values, rejected in keys")
         c = WGConfig(conf); c.setLine(4, value: "echo bye")
         check(diff(c.text) == [4] && c.text.contains("PostUp = echo bye # hook"), "setLine keeps comment")
         c = WGConfig(conf); c.add("PostUp", "echo two", in: 0)

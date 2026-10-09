@@ -99,7 +99,7 @@ private struct LiveField: View {
 
     var body: some View {
         HStack {
-            if secret && !state.reveal { SecureField(label, text: $state.draft) } else { TextField(label, text: $state.draft) }
+            if secret && !state.reveal { SecureField(label, text: $state.draft, prompt: Text("not set")) } else { TextField(label, text: $state.draft, prompt: Text("not set")) }
             if secret {
                 Button { state.reveal.toggle() } label: { Image(systemName: state.reveal ? "eye.slash" : "eye") }
                     .buttonStyle(.borderless).help(state.reveal ? "Hide" : "Show")
