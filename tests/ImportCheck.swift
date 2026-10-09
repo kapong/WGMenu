@@ -100,6 +100,93 @@ enum ImportCheck {
         check(fm.fileExists(atPath: hostile.appendingPathComponent("wg1.conf").path), "delete kept wg1.conf")
         check(sh(delCmd).status == 0, "delete of missing file ok")
 
+        // WGConfig: line-preserving parse/edit for the form editor.
+        let conf = """
+        # office tunnel
+        [Interface]
+        PrivateKey = priv  # secret
+        address=10.8.0.2/24
+        PostUp = echo hi # hook
+        Foo = bar
+
+        [peer]
+        PublicKey = pub
+        AllowedIPs = 10.8.0.0/24, 10.1.0.0/16
+        allowedips = fd00::/64
+        Endpoint = vpn.example.com:51820
+
+        """
+        let lines0 = conf.components(separatedBy: "\n")
+        func diff(_ a: String) -> [Int] {
+            let l = a.components(separatedBy: "\n")
+            return l.count == lines0.count ? l.indices.filter { l[$0] != lines0[$0] } : [-1]
+        }
+        var c = WGConfig(conf)
+        check(c.text == conf, "round trip unchanged")
+        check(WGConfig("[Interface]\r\nDNS = 1.1.1.1\r\n").text == "[Interface]\r\nDNS = 1.1.1.1\r\n", "CRLF round trip")
+        check(WGConfig("").text == "" && WGConfig("x").text == "x", "degenerate round trip")
+        check(c.interface == 0 && c.peers == [1], "sections case-insensitive")
+        check(c.addresses == ["10.8.0.2/24"] && c.dns == [], "address/dns lists")
+        check(c.allowedIPs == [["10.8.0.0/24", "10.1.0.0/16", "fd00::/64"]], "repeated AllowedIPs combined")
+        check(c.value("PrivateKey", in: 0) == "priv", "inline comment stripped")
+        check(c.value("AllowedIPs", in: 1) == "10.8.0.0/24, 10.1.0.0/16, fd00::/64", "combined value")
+
+        c.set("PrivateKey", to: "new", in: 0)
+        check(diff(c.text) == [2] && c.text.contains("PrivateKey = new  # secret\n"), "single-field edit changes one line, keeps comment")
+        c = WGConfig(conf); c.set("ADDRESS", to: "10.9.0.2/24", in: 0)
+        check(diff(c.text) == [3] && c.text.contains("\naddress=10.9.0.2/24\n"), "key case and spacing kept")
+        c = WGConfig(conf); c.set("Address", to: "10.8.0.2/24", in: 0)
+        check(c.text == conf, "unchanged value is a no-op")
+        c = WGConfig(conf); c.set("AllowedIPs", to: c.value("AllowedIPs", in: 1), in: 1)
+        check(c.text == conf, "unchanged combined value keeps duplicates")
+
+        c = WGConfig(conf); c.set("DNS", to: "1.1.1.1", in: 0)
+        var l = c.text.components(separatedBy: "\n")
+        check(l.count == lines0.count + 1 && l[6] == "DNS = 1.1.1.1" && l[7] == "" && l[8] == "[peer]", "insert absent key at end of section")
+        l.remove(at: 6)
+        check(l.joined(separator: "\n") == conf, "insert leaves other lines alone")
+        c = WGConfig(conf); c.set("MTU", to: "1380", in: 0, at: 3)
+        check(c.text.components(separatedBy: "\n")[3] == "MTU = 1380", "insert at hint")
+        c = WGConfig(conf); c.set("MTU", to: "1380", in: 0, at: 9)
+        check(c.text.components(separatedBy: "\n")[6] == "MTU = 1380", "hint outside section ignored")
+
+        c = WGConfig(conf); c.set("Foo", to: "", in: 0)
+        l = lines0; l.remove(at: 5)
+        check(c.text == l.joined(separator: "\n"), "remove key")
+        c = WGConfig(conf); c.set("AllowedIPs", to: "0.0.0.0/0", in: 1)
+        l = lines0; l[9] = "AllowedIPs = 0.0.0.0/0"; l.remove(at: 10)
+        check(c.text == l.joined(separator: "\n") && c.allowedIPs == [["0.0.0.0/0"]], "edit repeated key: first line rewritten, duplicates dropped")
+
+        c = WGConfig("[Interface]\nPrivateKey = k # main key\nDNS = 1.1.1.1\nDNS = 9.9.9.9 # backup\n")
+        c.set("PrivateKey", to: "", in: 0); c.set("DNS", to: "8.8.8.8", in: 0)
+        check(c.text == "[Interface]\n# main key\nDNS = 8.8.8.8\n# backup\n", "removed lines keep inline comments")
+        c = WGConfig("[Interface]\n"); c.set("MTU", to: "14\u{0}20", in: 0); c.add("Post\u{0}Up", "x", in: 0)
+        check(c.text == "[Interface]\nMTU = 1420\n" && !WGConfig.isValidKey("Post\u{0}Up"), "NUL stripped from values, rejected in keys")
+        c = WGConfig(conf); c.setLine(4, value: "echo bye")
+        check(diff(c.text) == [4] && c.text.contains("PostUp = echo bye # hook"), "setLine keeps comment")
+        c = WGConfig(conf); c.add("PostUp", "echo two", in: 0)
+        check(c.entries("PostUp", in: 0).map(\.value) == ["echo hi", "echo two"] && ConfigImport.hasHooks(c.text), "add repeats key")
+        c = WGConfig(conf); c.add("Bad=Key", "x", in: 0); c.set("PrivateKey", to: "a\nPostUp = x", in: 0)
+        check(!c.text.contains("Bad") && c.entries("PostUp", in: 0).count == 1, "invalid key and newline in value rejected")
+        c = WGConfig("[Interface]\nPrivateKey =\n"); c.setLine(1, value: "k")
+        check(c.text == "[Interface]\nPrivateKey = k\n", "fill empty value")
+
+        c = WGConfig(conf); c.addPeer()
+        check(c.text == conf + "\n[Peer]\n" && c.peers == [1, 2], "add peer appends blank line + header")
+        c = WGConfig("[Interface]\n\n"); c.addPeer()
+        check(c.text == "[Interface]\n\n[Peer]\n", "add peer reuses trailing blank line")
+        c = WGConfig("[Interface]\nPrivateKey = x"); c.addPeer(); c.set("PublicKey", to: "p", in: 1)
+        check(c.text == "[Interface]\nPrivateKey = x\n\n[Peer]\nPublicKey = p\n", "add peer without trailing newline")
+        c = WGConfig("[Interface]\r\nPrivateKey = x\r\n"); c.addPeer(); c.set("Endpoint", to: "h:1", in: 1)
+        check(c.text == "[Interface]\r\nPrivateKey = x\r\n\r\n[Peer]\r\nEndpoint = h:1\r\n", "CRLF kept on insert")
+
+        // Comments, unknown keys and hook lines survive a series of edits.
+        c = WGConfig(conf)
+        c.set("PrivateKey", to: "k2", in: 0); c.set("MTU", to: "1420", in: 0); c.set("Endpoint", to: "1.2.3.4:51820", in: 1)
+        for keep in ["# office tunnel", "PrivateKey = k2  # secret", "Foo = bar", "PostUp = echo hi # hook", "[peer]", "address=10.8.0.2/24"] {
+            check(c.text.contains(keep), "preserved \(keep)")
+        }
+
         print("ImportCheck: all passed")
     }
 

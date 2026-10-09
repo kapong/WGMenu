@@ -79,3 +79,136 @@ enum ConfigImport {
             + (admin ? " with administrator privileges" : "") + " without altering line endings"
     }
 }
+
+// Line-preserving model of a wg-quick config, for the form editor and AllowedIPs/route checks.
+// Parsing mirrors wg-quick: a line's code is the text before the first "#"; "[Name]" starts a section
+// (name compared case-insensitively); otherwise key = text before the first "=", value = the rest, both
+// trimmed. `text` round-trips byte for byte, and edits touch only the lines they must.
+//
+// Repeated keys: wg-quick accumulates repeated Address/DNS/AllowedIPs lines, so `value`/`values` read
+// all of them as one comma-separated list. `set` writes a changed combined value onto the first such
+// line and drops the later duplicates (the form shows one field, so one line holds it). Other repeated
+// keys (e.g. several PostUp lines) are separate commands: edit those per line with `setLine`.
+struct WGConfig {
+    struct Entry { let line: Int; let key: String; let value: String }
+    struct Section { let name: String; let header: Int; var entries: [Entry] }  // name lowercased
+
+    private(set) var lines: [String]
+    private(set) var sections: [Section] = []
+
+    init(_ text: String) {
+        lines = text.components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() {
+            let code = Self.trim(line.components(separatedBy: "#")[0])
+            if code.hasPrefix("["), code.hasSuffix("]") {
+                sections.append(Section(name: Self.trim(code.dropFirst().dropLast()).lowercased(), header: i, entries: []))
+            } else if !sections.isEmpty, let eq = code.firstIndex(of: "=") {
+                sections[sections.count - 1].entries.append(
+                    Entry(line: i, key: Self.trim(code[..<eq]), value: Self.trim(code[code.index(after: eq)...])))
+            }
+        }
+    }
+
+    var text: String { lines.joined(separator: "\n") }
+
+    // MARK: Reading
+
+    var interface: Int? { sections.firstIndex { $0.name == "interface" } }
+    var peers: [Int] { sections.indices.filter { sections[$0].name == "peer" } }
+    var addresses: [String] { interface.map { values("Address", in: $0) } ?? [] }
+    var dns: [String] { interface.map { values("DNS", in: $0) } ?? [] }
+    var allowedIPs: [[String]] { peers.map { values("AllowedIPs", in: $0) } }   // one list per [Peer]
+
+    func entries(_ key: String, in s: Int) -> [Entry] {
+        sections[s].entries.filter { $0.key.lowercased() == key.lowercased() }
+    }
+
+    // All lines of `key` in section `s`, joined with ", " ("" when absent).
+    func value(_ key: String, in s: Int) -> String {
+        entries(key, in: s).map(\.value).joined(separator: ", ")
+    }
+
+    // All lines of `key` in section `s`, split on commas, trimmed, empties dropped.
+    func values(_ key: String, in s: Int) -> [String] {
+        entries(key, in: s).flatMap { $0.value.split(separator: ",").map(Self.trim) }.filter { !$0.isEmpty }
+    }
+
+    // MARK: Editing
+
+    static func isValidKey(_ key: String) -> Bool {
+        !key.isEmpty && trim(key) == key && !key.contains { "=#[]\r\n\u{0}".contains($0) }
+    }
+
+    // Sets `key` in section `s`: rewrites the first line (dropping duplicates, see above), inserts a
+    // line when absent (at `hint` if it lies inside the section, else after its last key), and removes
+    // every line of the key when `value` is empty. An unchanged value leaves the text alone.
+    mutating func set(_ key: String, to value: String, in s: Int, at hint: Int? = nil) {
+        let v = Self.oneLine(value), found = entries(key, in: s)
+        guard Self.isValidKey(key), v != self.value(key, in: s) else { return }
+        if let first = found.first, !v.isEmpty {
+            lines[first.line] = Self.replacingValue(lines[first.line], with: v)
+            for e in found.dropFirst().reversed() { dropKeepingComment(e.line) }
+        } else if found.isEmpty {
+            let end = s + 1 < sections.count ? sections[s + 1].header : lines.count
+            let at = hint.flatMap { (sections[s].header + 1...end).contains($0) ? $0 : nil } ?? insertionPoint(s)
+            lines.insert("\(key) = \(v)\(eol)", at: at)
+        } else {
+            for e in found.reversed() { dropKeepingComment(e.line) }
+        }
+        self = WGConfig(text)
+    }
+
+    // Rewrites one key/value line's value, keeping its key spelling, spacing and inline comment.
+    mutating func setLine(_ line: Int, value: String) {
+        lines[line] = Self.replacingValue(lines[line], with: Self.oneLine(value))
+        self = WGConfig(text)
+    }
+
+    mutating func removeLine(_ line: Int) {
+        lines.remove(at: line)
+        self = WGConfig(text)
+    }
+
+    // Appends a new line even when the key already exists (e.g. a second PostUp).
+    mutating func add(_ key: String, _ value: String, in s: Int) {
+        guard Self.isValidKey(key) else { return }
+        lines.insert("\(key) = \(Self.oneLine(value))\(eol)", at: insertionPoint(s))
+        self = WGConfig(text)
+    }
+
+    // Appends an empty [Peer] section after a blank line.
+    mutating func addPeer() {
+        if lines.last != "" { lines[lines.count - 1] += eol; lines.append("") }
+        if lines.count > 1, !Self.trim(lines[lines.count - 2]).isEmpty { lines.insert(eol, at: lines.count - 1) }
+        lines.insert("[Peer]\(eol)", at: lines.count - 1)
+        self = WGConfig(text)
+    }
+
+    // MARK: Helpers
+
+    private var eol: String { lines.contains { $0.hasSuffix("\r") } ? "\r" : "" }  // keep CRLF files CRLF
+
+    private func insertionPoint(_ s: Int) -> Int { (sections[s].entries.last?.line ?? sections[s].header) + 1 }
+
+    private static func trim<S: StringProtocol>(_ s: S) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    // One line, no NUL (looksLikeConfig rejects NUL; bash `read` would drop it).
+    private static func oneLine(_ s: String) -> String {
+        trim(s.components(separatedBy: .newlines).joined(separator: " ").replacingOccurrences(of: "\u{0}", with: ""))
+    }
+
+    // Removes a key/value line, but keeps an inline "# comment" on it as a comment-only line.
+    private mutating func dropKeepingComment(_ line: Int) {
+        if let hash = lines[line].firstIndex(of: "#") { lines[line] = String(lines[line][hash...]) } else { lines.remove(at: line) }
+    }
+
+    // Swaps only the value text between "=" and any "#", keeping surrounding whitespace (and a "\r").
+    private static func replacingValue(_ raw: String, with value: String) -> String {
+        let hash = raw.firstIndex(of: "#") ?? raw.endIndex
+        guard let eq = raw[..<hash].firstIndex(of: "=") else { return raw }
+        let rest = raw[raw.index(after: eq)..<hash]
+        let lead = rest.prefix { $0.isWhitespace }, body = rest.dropFirst(lead.count)
+        guard !body.isEmpty else { return raw[...eq] + (value.isEmpty ? "" : " ") + value + rest + raw[hash...] }
+        return raw[...eq] + lead + value + String(body.reversed().prefix { $0.isWhitespace }.reversed()) + raw[hash...]
+    }
+}
