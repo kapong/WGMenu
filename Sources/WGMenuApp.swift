@@ -669,8 +669,10 @@ final class EditorWindow: NSObject, NSWindowDelegate {
         window.isRestorable = false
         window.delegate = self
         // Form fields share the window's field editor: give it the same protections as ConfigTextView.
+        // Selection changes fire on every focus (didBeginEditing only on the first keystroke), and
+        // SwiftUI resets these settings on each focus, so a focused but unedited field stays covered.
         fieldEditorObserver = NotificationCenter.default.addObserver(
-            forName: NSTextView.didBeginEditingNotification, object: nil, queue: .main) { [weak window] n in
+            forName: NSTextView.didChangeSelectionNotification, object: nil, queue: .main) { [weak window] n in
             guard let tv = n.object as? NSTextView, tv.window === window else { return }
             tv.isAutomaticTextReplacementEnabled = false
             if #available(macOS 15, *) { tv.writingToolsBehavior = .none }
