@@ -75,16 +75,18 @@ enum MenuBarLabel {
                 ctx.setBlendMode(.normal)
             }
             if let speed {
-                // Active direction: labelColor arrow + rate. Idle (exactly 0): tertiary arrow and "-".
+                // Active direction: labelColor arrow + rate. Idle (would show "0 B/s", i.e. < 0.5): tertiary
+                // arrow and "-".
                 // Rate left-aligned after the arrow; the fixed column keeps the label width stable.
                 let x0 = logoW + 1
-                let textAttrs: [NSAttributedString.Key: Any] = [.font: speedFont, .foregroundColor: NSColor.labelColor]
                 for (arrow, rate, y) in [("↑", speed.tx, rowY[0]), ("↓", speed.rx, rowY[1])] {
-                    let arrowColor: NSColor = rate > 0 ? .labelColor : .tertiaryLabelColor
+                    let active = rate >= 0.5
+                    let color: NSColor = active ? .labelColor : .tertiaryLabelColor
                     (arrow as NSString).draw(at: NSPoint(x: x0, y: y),
-                                             withAttributes: [.font: arrowFont, .foregroundColor: arrowColor])
-                    let text = rate > 0 ? "\(Stats.bytes(rate))/s" : "-"
-                    (text as NSString).draw(at: NSPoint(x: x0 + arrowW, y: y), withAttributes: textAttrs)
+                                             withAttributes: [.font: arrowFont, .foregroundColor: color])
+                    let text = active ? "\(Stats.bytes(rate))/s" : "-"
+                    (text as NSString).draw(at: NSPoint(x: x0 + arrowW, y: y),
+                                            withAttributes: [.font: speedFont, .foregroundColor: color])
                 }
             }
             return true
