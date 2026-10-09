@@ -308,11 +308,17 @@ final class TunnelStore: ObservableObject {
         UserDefaults.standard.set(offices, forKey: Self.officeKey)
     }
 
-    // Swap with the neighbour above (-1) or below (+1) and store the whole displayed order.
+    // Swap with the neighbour above (-1) or below (+1).
     func move(_ t: Tunnel, by offset: Int) {
+        guard let i = ordered.firstIndex(where: { $0.name == t.name }) else { return }
+        move(t.name, to: i + offset)
+    }
+
+    // Put `name` at `index` of the displayed order and store the whole order.
+    func move(_ name: String, to index: Int) {
         var names = ordered.map(\.name)
-        guard let i = names.firstIndex(of: t.name), names.indices.contains(i + offset) else { return }
-        names.swapAt(i, i + offset)
+        guard let i = names.firstIndex(of: name), names.indices.contains(index), index != i else { return }
+        names.insert(names.remove(at: i), at: index)
         setPriority(names)
         if activeCount > 1 { applyRoutes() }
     }
@@ -652,8 +658,59 @@ struct TunnelRow: View {
     }
 }
 
+// A row being dragged to a new priority. The list shows it at `index` while dragging; the order
+// is stored once, on drop, so routes are re-applied once per drag.
+@MainActor
+final class RowDrag: ObservableObject {
+    @Published var name: String?
+    @Published var index = 0
+    var mids: [String: CGFloat] = [:]   // each row's vertical centre in the list
+}
+
+struct RowMids: PreferenceKey {
+    static var defaultValue: [String: CGFloat] = [:]
+    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+@MainActor
+struct RowDropDelegate: DropDelegate {
+    let store: TunnelStore
+    let drag: RowDrag
+
+    func validateDrop(info: DropInfo) -> Bool { drag.name != nil }   // only our own rows
+
+    // Land above the first other row whose centre is below the pointer.
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard let name = drag.name else { return nil }
+        let i = drag.mids.filter { $0.key != name && $0.value < info.location.y }.count
+        if i != drag.index { withAnimation(.easeInOut(duration: 0.15)) { drag.index = i } }
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) { drag.name = nil }              // left the list, or cancelled
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let name = drag.name else { return false }
+        store.move(name, to: drag.index)
+        drag.name = nil
+        return true
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var store: TunnelStore
+    @StateObject private var drag = RowDrag()
+
+    // Priority order, with a dragged row shown where it would land.
+    private var rows: [Tunnel] {
+        var r = store.ordered
+        if let name = drag.name, let i = r.firstIndex(where: { $0.name == name }) {
+            r.insert(r.remove(at: i), at: min(drag.index, r.count - 1))
+        }
+        return r
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -670,7 +727,24 @@ struct ContentView: View {
                 Text(store.loaded ? "No configs found in /etc/wireguard" : "Loading…")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(store.ordered) { TunnelRow(tunnel: $0) }   // top = highest priority
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(rows) { t in                       // top = highest priority
+                        TunnelRow(tunnel: t)
+                            .background(GeometryReader { g in
+                                Color.clear.preference(key: RowMids.self, value: [t.name: g.frame(in: .named("rows")).midY])
+                            })
+                            .contentShape(Rectangle())         // drag from the blank middle too
+                            .onDrag {
+                                drag.name = t.name
+                                drag.index = store.ordered.firstIndex(where: { $0.name == t.name }) ?? 0
+                                return NSItemProvider(object: t.name as NSString)
+                            }
+                    }
+                }
+                .coordinateSpace(name: "rows")
+                .contentShape(Rectangle())                     // gaps between rows are still the list
+                .onPreferenceChange(RowMids.self) { drag.mids = $0 }
+                .onDrop(of: [.text], delegate: RowDropDelegate(store: store, drag: drag))
             }
 
             if let err = store.lastError {
