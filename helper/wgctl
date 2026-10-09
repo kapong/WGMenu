@@ -130,17 +130,15 @@ prepare_state() {
 # lockf(1) on macOS 13-15 can only wrap a whole command, not lock from inside a script.
 lock_state() {
   local lock="${STATE_DIR:?}/lock.pid" brk="${STATE_DIR:?}/lock.break" pid i=0
-  until ln -s "$$" "$lock" 2>/dev/null; do
+  while :; do
     i=$((i + 1))
     [ "$i" -le 300 ] || die "busy: another wgctl call holds $lock"
-    # Only the holder of lock.break (held for milliseconds) may judge and remove a stale lock.pid, so
-    # two waiters can't both break it and one remove the lock the other just took.
+    # lock.pid is only created or broken while holding lock.break (held for milliseconds), so a lock
+    # judged stale cannot change hands between the judgement and its removal.
     if ln -s "$$" "$brk" 2>/dev/null; then
+      if ln -s "$$" "$lock" 2>/dev/null; then rm -f "$brk"; break; fi
       pid=$(readlink "$lock" 2>/dev/null || true)
-      if { [ -L "$lock" ] || [ -e "$lock" ]; } && ! lock_holder_alive "$pid"; then
-        rm -f "$lock" "$brk"
-        continue
-      fi
+      if ! lock_holder_alive "$pid"; then rm -f "$lock" "$brk"; continue; fi   # stale
       rm -f "$brk"
     elif [ $(( $(date +%s) - $(stat -f %m "$brk" 2>/dev/null || date +%s) )) -gt 10 ]; then
       rm -f "$brk"      # its holder died mid-break
