@@ -39,7 +39,11 @@ enum RouteCheck {
         // Full tunnel.
         check(RouteRules.isFullTunnel(["10.8.0.0/24", "0.0.0.0/0"]), "v4 full")
         check(RouteRules.isFullTunnel(["::/0"]), "v6 full")
-        check(!RouteRules.isFullTunnel(["10.8.0.0/24", "0.0.0.0/1", "128.0.0.0/1"]), "split default is not /0")
+        check(RouteRules.isFullTunnel(["10.8.0.0/24", "0.0.0.0/1", "128.0.0.0/1"]), "v4 /1 halves")
+        check(RouteRules.isFullTunnel(["8000::/1", "10.8.0.0/24", "::/1"]), "v6 /1 halves")
+        check(!RouteRules.isFullTunnel(["0.0.0.0/1", "0.0.0.0/1"]), "one v4 half twice")
+        check(!RouteRules.isFullTunnel(["0.0.0.0/1", "8000::/1"]), "halves of different families")
+        check(!RouteRules.isFullTunnel(["128.0.0.0/1", "10.0.0.0/8"]), "one v4 half")
         check(!RouteRules.isFullTunnel(["garbage"]), "garbage")
 
         // Suggestion from Address.
@@ -70,6 +74,9 @@ enum RouteCheck {
         check(c2 == ["vpn2 is also a full tunnel (0.0.0.0/0 or ::/0).", "DNS is also set by vpn2 (1.1.1.1)."], "two full: \(c2)")
         let c3 = RouteRules.conflicts(home, with: [("vpn2", full), ("office", office)])
         check(c3 == ["AllowedIPs overlap with vpn2: 192.168.50.0/24 ↔ 0.0.0.0/0", "DNS is also set by vpn2 (1.1.1.1)."], "names other: \(c3)")
+        let halves = RouteRules.Routes(allowedIPs: ["0.0.0.0/1", "128.0.0.0/1"])
+        let c4 = RouteRules.conflicts(halves, with: [("vpn2", full)])
+        check(c4 == ["vpn2 is also a full tunnel (0.0.0.0/0 or ::/0)."], "halves vs full: \(c4)")
         let v6 = RouteRules.conflicts(.init(allowedIPs: ["fd00:1::/32"]), with: [("x", .init(allowedIPs: ["fd00::/16"]))])
         check(v6 == ["AllowedIPs overlap with x: fd00:1::/32 ↔ fd00::/16"], "v6 conflict: \(v6)")
 

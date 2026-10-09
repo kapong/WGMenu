@@ -167,7 +167,10 @@ final class TunnelStore: ObservableObject {
     // which prints no keys). Asks every time, Cancel by default; no "don't ask again".
     private func routesOK(_ name: String) async -> Bool {
         await refresh()
-        let up = tunnels.filter { $0.isUp && $0.name != name }.map(\.name)
+        // Other `up` toggles still running count too: `wgctl routes` reads down tunnels' configs as well.
+        var up = tunnels.filter(\.isUp).map(\.name)
+        up += upInFlight.subtracting(up).sorted()
+        up.removeAll { $0 == name }
         guard !up.isEmpty else { return true }
         var routes: [String: RouteRules.Routes] = [:]
         for n in [name] + up {
@@ -403,8 +406,9 @@ final class TunnelStore: ObservableObject {
 
     // Returns true when the editor may close (saved, or nothing changed).
     // `replace` is false for a new file finished from Import (never overwrite an existing config).
-    func save(name: String, original: String, edited: String, replace: Bool = true) -> Bool {
-        guard edited != original else { return true }
+    // `importing`: nothing is installed yet, so even unchanged (e.g. emptied) text goes through vet.
+    func save(name: String, original: String, edited: String, replace: Bool = true, importing: Bool = false) -> Bool {
+        guard importing || edited != original else { return true }
         guard ConfigImport.isValidName(name),
               Self.vet(edited, rejected: "Not saved", name: name, ok: "Save Anyway"),
               install([(name, Data(edited.utf8), replace)], failure: "Save failed") else { return false }
@@ -756,7 +760,8 @@ final class EditorWindow: NSObject, NSWindowDelegate {
                 guard model.text == model.original || TunnelStore.keepFullTunnel(name, model.text) else {
                     return model.showAllowedIPs()
                 }
-                if store.save(name: name, original: model.original, edited: model.text, replace: importing ?? true) {
+                if store.save(name: name, original: model.original, edited: model.text,
+                              replace: importing ?? true, importing: importing != nil) {
                     self?.closeLater()
                 }
             },

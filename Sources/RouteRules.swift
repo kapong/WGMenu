@@ -51,9 +51,13 @@ enum RouteRules {
         return CIDR(bytes: bytes, prefix: prefix)
     }
 
-    // Any /0 (0.0.0.0/0, ::/0) routes everything of that family through the tunnel.
+    // Any /0 (0.0.0.0/0, ::/0), or both /1 halves (0.0.0.0/1 + 128.0.0.0/1, ::/1 + 8000::/1), routes
+    // everything of that family through the tunnel.
     static func isFullTunnel(_ allowedIPs: [String]) -> Bool {
-        allowedIPs.contains { parse($0)?.prefix == 0 }
+        let cidrs = allowedIPs.compactMap(parse)
+        return cidrs.contains { $0.prefix == 0 } || [4, 16].contains { n in
+            Set(cidrs.filter { $0.bytes.count == n && $0.prefix == 1 }.map { $0.network[0] }).count == 2
+        }
     }
 
     // The VPN subnet(s) from Interface Address: "10.8.0.2/24" -> "10.8.0.0/24". Host-only (/32, /128)
@@ -109,9 +113,9 @@ enum RouteRules {
             var out: [String] = []
             let bothFull = full && isFullTunnel(o.routes.allowedIPs)
             if bothFull { out.append("\(o.name) is also a full tunnel (0.0.0.0/0 or ::/0).") }
-            // When both are full, /0 against /0 is already said above.
+            // When both are full, default against default (/0 or /1 halves) is already said above.
             let pairs = overlapPairs(target.allowedIPs, o.routes.allowedIPs)
-                .filter { !bothFull || $0.0.prefix > 0 || $0.1.prefix > 0 }.map { "\($0) ↔ \($1)" }
+                .filter { !bothFull || $0.0.prefix > 1 || $0.1.prefix > 1 }.map { "\($0) ↔ \($1)" }
             if !pairs.isEmpty { out.append("AllowedIPs overlap with \(o.name): " + pairs.joined(separator: ", ")) }
             if !target.dns.isEmpty, !o.routes.dns.isEmpty {
                 out.append("DNS is also set by \(o.name) (\(o.routes.dns.joined(separator: ", "))).")
