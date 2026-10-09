@@ -8,15 +8,16 @@ import AppKit
 // an HStack label, so logo and speeds cannot be split into a colored image + a template image. The image
 // is handed to NSStatusBarButton as-is and its drawing handler runs at draw time under the button's own
 // appearance (VibrantDark/VibrantLight, even when the app appearance differs), so labelColor and
-// secondaryLabelColor resolve for the menu bar, not for the app.
+// tertiaryLabelColor resolve for the menu bar, not for the app.
 enum MenuBarLabel {
     static let height: CGFloat = 18
     static let logoSize: CGFloat = 16, logoY: CGFloat = 1     // logo 16x16 pt at y 1...17
 
     // Count disc (pt, label coordinates): 9 pt across, spanning x 6...15, y 0...9 (pixel-aligned at 2x),
-    // over the lower loop of the 8. A 0.9 pt clear ring separates it from the logo. White 8 pt heavy
-    // digit: chosen over a cut-out digit, which takes the menu-bar colour and loses contrast on dark bars.
-    // 10+ uses the condensed width and grows the disc into a capsule.
+    // over the lower loop of the 8. A 0.9 pt clear ring separates it from the logo. 8 pt heavy digit cut
+    // out of the disc (clear blend) so the menu bar shows through, like the logo's snake; a fixed white
+    // digit was hard to read on the green/orange disc. 10+ uses the condensed width and grows the disc
+    // into a capsule.
     static let discD: CGFloat = 9, discCX: CGFloat = 10.5, discCY: CGFloat = 4.5, discRing: CGFloat = 0.9
     static let digitFont = NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .heavy)
     static let digitsFont = NSFont.systemFont(ofSize: 8, weight: .heavy, width: .condensed)
@@ -24,7 +25,7 @@ enum MenuBarLabel {
     static let arrowFont = NSFont.systemFont(ofSize: 9, weight: .semibold)
     static let speedFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
     static let arrowW: CGFloat = 7
-    static let speedW: CGFloat = 49                          // fits "999.9 KB/s" (48.8 pt)
+    static let speedW: CGFloat = 43                          // fits "999 MB/s" (42.1 pt), widest Stats.bytes output
     static let rowY: [CGFloat] = [9, 0]                      // ↑ row, ↓ row draw origins: no clipping in 18 pt
 
     // Settable so a render harness (no app bundle) can inject the PDF.
@@ -42,7 +43,7 @@ enum MenuBarLabel {
         let color = tint(health)
         let digits = count > 0 ? "\(count)" : ""
         let font = digits.count > 1 ? digitsFont : digitFont
-        let digitAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+        let digitAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
         let digitW = (digits as NSString).size(withAttributes: digitAttrs).width
         let disc: NSRect? = digits.isEmpty ? nil : {
             let w = max(discD, digitW + 2.2)
@@ -67,18 +68,25 @@ enum MenuBarLabel {
                 ctx.setBlendMode(.normal)
                 color.setFill()
                 NSBezierPath(roundedRect: disc, xRadius: r, yRadius: r).fill()
+                ctx.setBlendMode(.clear)
                 (digits as NSString).draw(at: NSPoint(x: disc.midX - digitW / 2,
                                                       y: disc.midY - font.capHeight / 2 + font.descender),
                                           withAttributes: digitAttrs)
+                ctx.setBlendMode(.normal)
             }
             if let speed {
+                // Active direction: labelColor arrow + rate. Idle (would show "0 B/s", i.e. < 0.5): tertiary
+                // arrow and "-".
+                // Rate left-aligned after the arrow; the fixed column keeps the label width stable.
                 let x0 = logoW + 1
-                let arrowAttrs: [NSAttributedString.Key: Any] = [.font: arrowFont, .foregroundColor: NSColor.secondaryLabelColor]
-                let textAttrs: [NSAttributedString.Key: Any] = [.font: speedFont, .foregroundColor: NSColor.labelColor]
-                for (arrow, text, y) in [("↑", "\(Stats.bytes(speed.tx))/s", rowY[0]), ("↓", "\(Stats.bytes(speed.rx))/s", rowY[1])] {
-                    (arrow as NSString).draw(at: NSPoint(x: x0, y: y), withAttributes: arrowAttrs)
-                    let w = (text as NSString).size(withAttributes: textAttrs).width
-                    (text as NSString).draw(at: NSPoint(x: x0 + arrowW + speedW - w, y: y), withAttributes: textAttrs)
+                for (arrow, rate, y) in [("↑", speed.tx, rowY[0]), ("↓", speed.rx, rowY[1])] {
+                    let active = rate >= 0.5
+                    let color: NSColor = active ? .labelColor : .tertiaryLabelColor
+                    (arrow as NSString).draw(at: NSPoint(x: x0, y: y),
+                                             withAttributes: [.font: arrowFont, .foregroundColor: color])
+                    let text = active ? "\(Stats.bytes(rate))/s" : "-"
+                    (text as NSString).draw(at: NSPoint(x: x0 + arrowW, y: y),
+                                            withAttributes: [.font: speedFont, .foregroundColor: color])
                 }
             }
             return true
