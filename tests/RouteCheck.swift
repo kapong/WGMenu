@@ -93,6 +93,10 @@ enum RouteCheck {
         check(RouteRules.fullFamilies(["0.0.0.0/0", "::/1"]) == [4] && RouteRules.fullFamilies(["::/1", "8000::/1"]) == [16], "full families")
         let v6 = RouteRules.conflicts(.init(allowedIPs: ["fd00:1::/32"]), with: [("x", .init(allowedIPs: ["fd00::/16"]))], higher: [])
         check(v6 == ["AllowedIPs overlap with x: fd00:1::/32 ↔ fd00::/16. This tunnel has higher priority and takes it."], "v6 conflict: \(v6)")
+        // A tunnel started outside WGMenu: priority decides nothing, whichever side ranks higher.
+        let c7 = RouteRules.conflicts(home, with: [("vpn2", full)], higher: ["vpn2"], outside: ["vpn2"])
+        check(c7 == ["AllowedIPs overlap with vpn2: 192.168.50.0/24 ↔ 0.0.0.0/0. vpn2 was started outside WGMenu; its routes are not managed.",
+                     "DNS is also set by vpn2 (1.1.1.1). vpn2 was started outside WGMenu; its routes are not managed."], "outside: \(c7)")
 
         // Subtraction.
         func sub(_ a: String, _ b: String) -> [String] { RouteRules.subtract(cidr(a), cidr(b)).map(\.description) }

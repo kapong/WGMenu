@@ -85,7 +85,8 @@ WireGuard needs root to bring tunnels up. WGMenu keeps that surface small:
 ## Tips and limitations
 
 - Priority routing needs the current helper: re-run `sudo wgmenu-setup` after upgrading (WGMenu says the helper is out of date otherwise).
-- Priority routing applies only to tunnels WGMenu connects. A tunnel started outside WGMenu (e.g. `wg-quick up` in Terminal) keeps `wg-quick`'s own routes and WGMenu leaves them alone; disconnect it and connect it from WGMenu.
+- Priority routing applies only to tunnels WGMenu connects. A tunnel started outside WGMenu (e.g. `wg-quick up` in Terminal) keeps `wg-quick`'s own routes and WGMenu leaves them alone: the menu shows "X was started outside WGMenu; priority routing not applied." with a **Take over** button. Take over asks first, then (after the usual conflict check) reconnects the tunnel from WGMenu, which briefly interrupts it, and installs its routes by priority.
+- Crash recovery: on launch WGMenu re-applies its route plan, removing recorded routes of tunnels that are no longer up and restoring those of tunnels it connected before. `/var/run/wgmenu` is cleared on reboot.
 - DNS follows priority only for tunnels WGMenu connected since it was launched; a tunnel connected before that keeps whatever DNS it set.
 - If a tunnel WGMenu connected is disconnected outside WGMenu, its recorded routes stay in `/var/run/wgmenu/routes` until WGMenu next applies routes. macOS `route delete` matches by destination, so that cleanup could remove an identical route another tool added meanwhile.
 - While offline (no default gateway), a full tunnel's endpoint has no route of its own and WGMenu adds no blackhole route like `wg-quick` does; it is added again as soon as the network returns.

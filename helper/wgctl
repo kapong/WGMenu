@@ -78,16 +78,20 @@ iface_of() {
   echo "$iface"
 }
 
-# One line per tunnel: name<TAB>up|down<TAB>iface<TAB>latest_handshake_epoch<TAB>rx_bytes<TAB>tx_bytes
+# One line per tunnel: name<TAB>up|down<TAB>iface<TAB>latest_handshake_epoch<TAB>rx_bytes<TAB>tx_bytes<TAB>owner
+# owner (added last, so older apps still read the first six): "managed" if WGMenu brought the up
+# tunnel up (its root-only copy exists, see STATE_DIR), "outside" if it is up without one, "-" if down.
 status() {
-  local n iface stats
+  local n iface stats owner
   while IFS= read -r n; do
     if iface=$(iface_of "$n"); then
       stats=$(run_clean "$LIBEXEC/wg" show "$iface" dump 2>/dev/null \
         | awk -F'\t' 'NR>1 { if ($5>h) h=$5; rx+=$6; tx+=$7 } END { printf "%.0f\t%.0f\t%.0f", h, rx, tx }') || true
-      printf '%s\tup\t%s\t%s\n' "$n" "$iface" "${stats:-0	0	0}"
+      owner=outside
+      if [ -f "$STATE_DIR/$n.conf" ] && [ ! -L "$STATE_DIR/$n.conf" ]; then owner=managed; fi
+      printf '%s\tup\t%s\t%s\t%s\n' "$n" "$iface" "${stats:-0	0	0}" "$owner"
     else
-      printf '%s\tdown\t-\t0\t0\t0\n' "$n"
+      printf '%s\tdown\t-\t0\t0\t0\t-\n' "$n"
     fi
   done < <(list_names)
 }
@@ -276,6 +280,18 @@ desired_routes() {
   done <<< "$names"
 }
 
+# Drops the copies of tunnels that are not up (stopped outside WGMenu, or left behind by a crash), so a
+# later plain `wg-quick up` of that name isn't taken for one WGMenu started. Their state lines go with
+# the reconcile that follows, since desired_routes only lists up tunnels. Caller holds the lock.
+prune_copies() {
+  local f
+  shopt -s nullglob
+  for f in "${STATE_DIR:?}"/*.conf; do
+    iface_of "$(basename "$f" .conf)" >/dev/null || rm -f "$f"
+  done
+  shopt -u nullglob
+}
+
 state_lines() { if [ -f "$STATE" ]; then cat "$STATE"; fi; }
 has_line() { grep -Fxq -- "$2" <<< "$1"; }
 
@@ -354,6 +370,7 @@ case "$cmd" in
     ;;
   apply-routes)
     prepare_state
+    prune_copies
     want=$(desired_routes)
     reconcile "$want"
     ;;

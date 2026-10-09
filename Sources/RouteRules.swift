@@ -170,12 +170,15 @@ enum RouteRules {
     }
 
     // Reasons connecting `target` clashes with tunnels already up, naming each other tunnel and which
-    // side wins by priority. `higher`: the names among `others` ranked above `target`.
-    static func conflicts(_ target: Routes, with others: [(name: String, routes: Routes)], higher: Set<String>) -> [String] {
+    // side wins by priority. `higher`: the names among `others` ranked above `target`. `outside`: the
+    // ones started outside WGMenu, whose routes priority doesn't decide.
+    static func conflicts(_ target: Routes, with others: [(name: String, routes: Routes)], higher: Set<String>,
+                          outside: Set<String> = []) -> [String] {
         let full = fullFamilies(target.allowedIPs)
         return others.flatMap { o -> [String] in
             var out: [String] = []
-            let wins = higher.contains(o.name) ? " \(o.name) has higher priority and keeps it." : " This tunnel has higher priority and takes it."
+            let wins = outside.contains(o.name) ? " \(o.name) was started outside WGMenu; its routes are not managed."
+                : higher.contains(o.name) ? " \(o.name) has higher priority and keeps it." : " This tunnel has higher priority and takes it."
             let bothFull = full.intersection(fullFamilies(o.routes.allowedIPs))
             if !bothFull.isEmpty {
                 let defaults = [(4, "0.0.0.0/0"), (16, "::/0")].filter { bothFull.contains($0.0) }.map(\.1)

@@ -12,6 +12,7 @@ struct Tunnel: Identifiable {
     let lastHandshake: Date?
     let rx: Int64
     let tx: Int64
+    let managed: Bool?      // up: brought up by WGMenu (`wgctl up`)? nil if down or the helper predates it
     var id: String { name }
 }
 
@@ -65,7 +66,7 @@ enum Helper {
 @MainActor
 final class TunnelStore: ObservableObject {
     @Published var tunnels: [Tunnel] = []
-    @Published var busy: Set<String> = []
+    @Published var busy: Set<String> = [] { didSet { retryOfficeOff() } }
     @Published var lastError: String?
     @Published var loaded = false
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -88,8 +89,14 @@ final class TunnelStore: ObservableObject {
     private var applying = false                        // an applyRoutes() pass is running
     private var applyAgain = false                      // ... and another was asked for meanwhile
     private var dnsApplied: [String: Bool] = [:]        // tunnels this run brought up -> DNS applied (no nodns)
+    private var pendingOff: Set<String> = []            // office auto-off waiting for a busy tunnel
+    private var warnedOldHelper = false                 // "helper out of date" shown once, not every poll
+    private static let oldHelper = "The helper is out of date. Re-run: sudo wgmenu-setup"
 
     var activeCount: Int { tunnels.filter(\.isUp).count }
+
+    // Up tunnels started outside WGMenu (plain `wg-quick up`): wg-quick's routes, not the priority plan.
+    var outside: [Tunnel] { ordered.filter { $0.isUp && $0.managed == false && !busy.contains($0.name) } }
 
     // Tunnels in priority order (highest first); ones not in `priority` follow in status order.
     var ordered: [Tunnel] {
@@ -103,7 +110,9 @@ final class TunnelStore: ObservableObject {
     }
 
     init() {
-        Task { await refresh() }
+        // Crash recovery: polls right away, then applies the current plan, which drops routes (and
+        // copies) of tunnels no longer up and restores those of tunnels WGMenu brought up before.
+        applyRoutes()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.refreshTask == nil else { return }   // periodic poll: skip if one is running
@@ -140,7 +149,12 @@ final class TunnelStore: ObservableObject {
                           iface: f[2],
                           lastHandshake: hs > 0 ? Date(timeIntervalSince1970: hs) : nil,
                           rx: Int64(f[4]) ?? 0,
-                          tx: Int64(f[5]) ?? 0)
+                          tx: Int64(f[5]) ?? 0,
+                          managed: f.count >= 7 && f[1] == "up" ? f[6] == "managed" : nil)
+        }
+        if !warnedOldHelper, tunnels.contains(where: { $0.isUp && $0.managed == nil }) {
+            warnedOldHelper = true
+            lastError = Self.oldHelper
         }
         let now = clock_gettime_nsec_np(CLOCK_MONOTONIC)
         var cur: [String: Stats.Counters] = [:]
@@ -164,13 +178,28 @@ final class TunnelStore: ObservableObject {
 
     func toggle(_ t: Tunnel) {
         guard !busy.contains(t.name) else { return }
-        let action = t.isUp ? "down" : "up"
-        let name = t.name
+        run(t.name, up: !t.isUp)
+    }
+
+    // Take over a tunnel started outside WGMenu: reconnect it through `wgctl up` (after the usual
+    // conflict check) so priority routing covers it. Only ever on the user's request.
+    func takeOver(_ t: Tunnel) {
+        guard !busy.contains(t.name) else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        guard Self.confirm("Take over \(t.name)?",
+                           "\(t.name) disconnects briefly and reconnects from WGMenu, which then installs its routes by priority and replaces the ones wg-quick added.",
+                           ok: "Take Over") else { return }
+        run(t.name, up: true, reconnect: true)
+    }
+
+    // `reconnect`: take the (outside) tunnel down right before the `up`, once the checks passed.
+    private func run(_ name: String, up: Bool, reconnect: Bool = false) {
+        let action = up ? "up" : "down"
         busy.insert(name)
-        if action == "up" { upInFlight.insert(name) }
+        if up { upInFlight.insert(name) }
         Task {
             var args = [action, name]
-            if action == "up" {
+            if up {
                 guard let routes = await routesOK(name) else {
                     busy.remove(name)
                     upInFlight.remove(name)
@@ -182,8 +211,10 @@ final class TunnelStore: ObservableObject {
                 if let owner, owner != name { args.append("nodns") }
                 if owner == name { for n in dnsHolders(routes, except: name) { await bounce(n, dns: false) } }
             }
-            let r = await Helper.runAsync(args)
-            lastError = r.status == 0 ? nil : "\(action) \(name) failed: " + Self.explain(r)
+            var r = Helper.Result(status: 0, out: "", err: "")
+            if reconnect { r = await Helper.runAsync(["down", name]) }
+            if r.status == 0 { r = await Helper.runAsync(args) }
+            lastError = r.status == 0 ? nil : "\(reconnect ? "Take over" : action) \(name) failed: " + Self.explain(r)
             await refresh()
             if r.status == 0 {
                 dnsApplied[name] = action == "up" ? !args.contains("nodns") : nil
@@ -214,7 +245,8 @@ final class TunnelStore: ObservableObject {
             routes[n] = RouteRules.parseRoutes(r.out)
         }
         let higher = Set(ordered.map(\.name).prefix(while: { $0 != name }))
-        let issues = RouteRules.conflicts(routes[name]!, with: up.map { ($0, routes[$0]!) }, higher: higher)
+        let issues = RouteRules.conflicts(routes[name]!, with: up.map { ($0, routes[$0]!) }, higher: higher,
+                                          outside: Set(outside.map(\.name)))
         guard !issues.isEmpty else { return routes }
         NSApp.activate(ignoringOtherApps: true)
         return Self.confirm("\(name) conflicts with a connected tunnel",
@@ -309,7 +341,24 @@ final class TunnelStore: ObservableObject {
             let names = OfficeRules.toDisconnect(mac: mac, lastMAC: lastGatewayMAC, offices: offices,
                                                  up: tunnels.filter(\.isUp).map(\.name))
             lastGatewayMAC = mac
-            for t in tunnels where names.contains(t.name) { toggle(t) }
+            pendingOff = []                             // a new network replaces any wait from the last one
+            for t in tunnels where names.contains(t.name) { officeOff(t) }
+        }
+    }
+
+    // A busy tunnel (e.g. reconnecting to move DNS) is turned off as soon as it is free again.
+    private func officeOff(_ t: Tunnel) {
+        if busy.contains(t.name) { pendingOff.insert(t.name) } else { toggle(t) }   // up, so toggle = down
+    }
+
+    // Runs when `busy` changes: re-reads status and turns off only tunnels that are still up (never on).
+    private func retryOfficeOff() {
+        let ready = pendingOff.subtracting(busy)
+        guard !ready.isEmpty else { return }
+        pendingOff.subtract(ready)
+        Task {
+            await refresh()
+            for t in tunnels where ready.contains(t.name) && t.isUp { officeOff(t) }
         }
     }
 
@@ -604,7 +653,7 @@ final class TunnelStore: ObservableObject {
             return "sudo rule missing. Run: sudo wgmenu-setup"
         }
         if lines.contains(where: { $0.contains("wgctl: usage:") }) {   // a helper older than this app
-            return "The helper is out of date. Re-run: sudo wgmenu-setup"
+            return oldHelper
         }
         let tail = lines.suffix(3).joined(separator: "\n")
         return tail.isEmpty ? "exit code \(r.status)" : tail
@@ -789,6 +838,18 @@ struct ContentView: View {
                 .contentShape(Rectangle())                     // gaps between rows are still the list
                 .onPreferenceChange(RowMids.self) { drag.mids = $0 }
                 .onDrop(of: [.text], delegate: RowDropDelegate(store: store, drag: drag))
+            }
+
+            ForEach(store.outside) { t in
+                HStack {
+                    Text("\(t.name) was started outside WGMenu; priority routing not applied.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("Take over") { Task { @MainActor in store.takeOver(t) } }   // deferred: alert goes modal
+                        .controlSize(.small)
+                }
             }
 
             if let err = store.lastError {
