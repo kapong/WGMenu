@@ -41,23 +41,43 @@ enum OfficeCheck {
         check(!OfficeRules.isIPv4("1.1.1.0001"), "4-digit octet")
 
         // Dedup on mark.
-        check(OfficeRules.adding("aa:bb:cc:dd:ee:ff", to: []) == ["aa:bb:cc:dd:ee:ff"], "add to empty")
-        check(OfficeRules.adding("aa:bb:cc:dd:ee:ff", to: ["aa:bb:cc:dd:ee:ff"]) == ["aa:bb:cc:dd:ee:ff"], "dedup")
-        check(OfficeRules.adding("11:22:33:44:55:66", to: ["aa:bb:cc:dd:ee:ff"]).count == 2, "second network")
+        check(OfficeRules.adding(["aa:bb:cc:dd:ee:ff"], to: []) == ["aa:bb:cc:dd:ee:ff"], "add to empty")
+        check(OfficeRules.adding(["aa:bb:cc:dd:ee:ff"], to: ["aa:bb:cc:dd:ee:ff"]) == ["aa:bb:cc:dd:ee:ff"], "dedup")
+        check(OfficeRules.adding(["11:22:33:44:55:66"], to: ["aa:bb:cc:dd:ee:ff"]).count == 2, "second network")
 
-        // Which tunnels to take down.
-        let office = "aa:bb:cc:dd:ee:ff", home = "11:22:33:44:55:66"
-        let offices = ["work": [home + "x", office], "lab": [office], "other": [home]]
-        check(OfficeRules.toDisconnect(mac: office, lastMAC: home, offices: offices, up: ["work", "other"]) == ["work"],
-              "arrival takes down up tunnels listing the MAC")
-        check(OfficeRules.toDisconnect(mac: office, lastMAC: nil, offices: offices, up: ["work", "lab"]) == ["work", "lab"],
-              "launch in office counts as arrival")
-        check(OfficeRules.toDisconnect(mac: office, lastMAC: office, offices: offices, up: ["work"]).isEmpty,
-              "same MAC (manual re-enable) -> none")
-        check(OfficeRules.toDisconnect(mac: nil, lastMAC: home, offices: offices, up: ["work"]).isEmpty, "no gateway -> none")
-        check(OfficeRules.toDisconnect(mac: home, lastMAC: office, offices: offices, up: ["work"]).isEmpty, "leaving -> none")
-        check(OfficeRules.toDisconnect(mac: office, lastMAC: home, offices: offices, up: []).isEmpty, "nothing up -> none")
-        check(OfficeRules.toDisconnect(mac: office, lastMAC: home, offices: [:], up: ["work"]).isEmpty, "no rules -> none")
+        // Public lookup: HTTP body, ifconfig.co JSON, ipify plain text.
+        check(OfficeRules.httpBody("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}") == "{}", "http 200")
+        check(OfficeRules.httpBody("HTTP/1.1 429 Too Many\r\n\r\n{}") == nil, "non-200")
+        check(OfficeRules.httpBody("{}") == nil, "no headers")
+        let json = #"{"ip":"203.0.113.5","ip_decimal":1,"country":"TH","asn":"AS64500","asn_org":"Example ISP","hostname":"office-1.example.net"}"#
+        let pub = OfficeRules.publicFromJSON(json)
+        check(pub?.ipv4 == "203.0.113.5", "json ip")
+        check(pub?.label == "203.0.113.5 (AS64500 Example ISP) / office-1.example.net", "label with asn_org and hostname")
+        check(OfficeRules.publicFromJSON(#"{"ip":"203.0.113.5"}"#)?.label == "203.0.113.5", "json missing fields")
+        check(OfficeRules.publicFromJSON(#"{"ip":"203.0.113.5","hostname":"203.0.113.5"}"#)?.label == "203.0.113.5",
+              "hostname echoing the ip not repeated")
+        check(OfficeRules.publicFromJSON(#"{"ip":"2001:db8::1"}"#) != nil, "ipv6 decodes")
+        check(OfficeRules.publicFromJSON(#"{"ip":"2001:db8::1"}"#)?.ipv4 == nil, "ipv6 is not a key")
+        check(OfficeRules.publicFromJSON("<html>203.0.113.5</html>") == nil, "html rejected")
+        check(OfficeRules.publicFromPlain("203.0.113.7\n")?.ipv4 == "203.0.113.7", "ipify plain")
+        check(OfficeRules.publicFromPlain("2001:db8::1") == nil, "ipify ipv6 rejected")
+        check(OfficeRules.usesPublic(["a": ["aa:bb:cc:dd:ee:ff", "203.0.113.7"]]), "list has ip")
+        check(!OfficeRules.usesPublic(["a": ["aa:bb:cc:dd:ee:ff"]]), "macs only")
+        check(OfficeRules.adding(["203.0.113.5"], to: ["203.0.113.5"]) == ["203.0.113.5"], "dedup ip")
+
+        // Which tunnels to take down (arrival is gated by the caller).
+        let office = "aa:bb:cc:dd:ee:ff", home = "11:22:33:44:55:66", ip = "203.0.113.7"
+        let offices = ["work": [home + "x", office], "lab": [office], "other": [home], "byip": [ip]]
+        check(OfficeRules.toDisconnect(ids: [office], offices: offices, up: ["work", "other"]) == ["work"], "up tunnels listing the MAC")
+        check(OfficeRules.toDisconnect(ids: [office], offices: offices, up: ["work", "lab"]) == ["work", "lab"], "several tunnels")
+        check(OfficeRules.toDisconnect(ids: [], offices: offices, up: ["work"]).isEmpty, "no identifiers -> none")
+        check(OfficeRules.toDisconnect(ids: [home], offices: offices, up: ["work"]).isEmpty, "other network -> none")
+        check(OfficeRules.toDisconnect(ids: [office], offices: offices, up: []).isEmpty, "nothing up -> none")
+        check(OfficeRules.toDisconnect(ids: [office], offices: [:], up: ["work"]).isEmpty, "no rules -> none")
+        check(OfficeRules.toDisconnect(ids: [ip], offices: offices, up: ["byip", "work"]) == ["byip"], "no MAC: public IP matches")
+        check(OfficeRules.toDisconnect(ids: [office, ip], offices: offices, up: ["byip", "lab"]) == ["byip", "lab"],
+              "MAC and IP both matched")
+        check(OfficeRules.toDisconnect(ids: ["198.51.100.9"], offices: offices, up: ["byip"]).isEmpty, "other IP -> none")
 
         print("OfficeCheck: all passed")
     }
