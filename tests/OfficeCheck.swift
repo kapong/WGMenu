@@ -90,6 +90,12 @@ enum OfficeCheck {
               "per-tunnel: only tunnels not listing this network")
         check(OfficeRules.toReconnect(ids: [office], suspended: ["gone"], offices: offices) == ["gone"],
               "no office list -> nothing holds it down")
+        check(OfficeRules.toReconnect(ids: [office, ip], suspended: ["byip", "lab"], offices: offices).isEmpty,
+              "IP-marked office: MAC and looked-up IP -> stays paused")
+        check(OfficeRules.toReconnect(ids: [office], suspended: ["byip"], offices: offices) == ["byip"],
+              "MAC alone can't tell an IP-marked office (why the lookup covers suspended tunnels)")
+        check(OfficeRules.toReconnect(ids: [home, "198.51.100.9"], suspended: ["byip", "lab"], offices: offices) == ["byip", "lab"],
+              "other MAC and IP -> left the office")
 
         // Pruning stale persisted entries.
         let offs = ["work": [office], "lab": [String]()]
