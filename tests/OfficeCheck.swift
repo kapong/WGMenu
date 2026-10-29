@@ -92,10 +92,26 @@ enum OfficeCheck {
               "no office list -> nothing holds it down")
         check(OfficeRules.toReconnect(ids: [office, ip], suspended: ["byip", "lab"], offices: offices).isEmpty,
               "IP-marked office: MAC and looked-up IP -> stays paused")
-        check(OfficeRules.toReconnect(ids: [office], suspended: ["byip"], offices: offices) == ["byip"],
-              "MAC alone can't tell an IP-marked office (why the lookup covers suspended tunnels)")
+        check(OfficeRules.toReconnect(ids: [office], suspended: ["byip"], offices: offices).isEmpty,
+              "MAC alone can't rule out an IP-marked office -> held (the lookup covers suspended tunnels)")
         check(OfficeRules.toReconnect(ids: [home, "198.51.100.9"], suspended: ["byip", "lab"], offices: offices) == ["byip", "lab"],
               "other MAC and IP -> left the office")
+        // Partial identification: a missing kind holds the tunnel.
+        check(OfficeRules.toReconnect(ids: [home], suspended: ["byip"], offices: offices).isEmpty,
+              "MAC-only ids vs IP-marked tunnel -> held")
+        check(OfficeRules.toReconnect(ids: ["198.51.100.9"], suspended: ["lab"], offices: offices).isEmpty,
+              "IP-only ids vs MAC-marked tunnel -> held")
+        check(OfficeRules.toReconnect(ids: [home, "198.51.100.9"], suspended: ["byip", "lab"], offices: offices) == ["byip", "lab"],
+              "both kinds present, none matching -> released")
+        let mixed = ["mix": [office, ip]]
+        check(OfficeRules.toReconnect(ids: [home], suspended: ["mix"], offices: mixed).isEmpty, "mixed list, IP kind missing -> held")
+        check(OfficeRules.toReconnect(ids: ["198.51.100.9"], suspended: ["mix"], offices: mixed).isEmpty, "mixed list, MAC kind missing -> held")
+        check(OfficeRules.toReconnect(ids: [office], suspended: ["mix"], offices: mixed).isEmpty, "mixed list, MAC matches -> held")
+        check(OfficeRules.undecided(ids: [home], suspended: ["byip"], offices: offices), "held for a missing kind -> undecided")
+        check(!OfficeRules.undecided(ids: [office], suspended: ["mix"], offices: mixed), "matched -> decided")
+        check(!OfficeRules.undecided(ids: [home], suspended: ["lab"], offices: offices), "all kinds present -> decided")
+        check(OfficeRules.undecided(ids: [], suspended: ["lab"], offices: offices), "nothing identified -> undecided")
+        check(!OfficeRules.undecided(ids: [], suspended: [], offices: offices), "nothing suspended -> decided")
 
         // Pruning stale persisted entries.
         let offs = ["work": [office], "lab": [String]()]

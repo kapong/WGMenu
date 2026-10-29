@@ -138,7 +138,11 @@ final class TunnelStore: ObservableObject {
                 guard let self, self.refreshTask == nil else { return }   // periodic poll: skip if one is running
                 await self.refresh()
                 self.ticks += 1
-                if self.ticks % 6 == 0 { self.retryAway() }   // ~30 s
+                guard self.ticks % 6 == 0 else { return }  // ~30 s
+                // Not fully identified for a suspended tunnel (e.g. lookup failed behind a captive portal):
+                // identify again, unless offline. Else retry failed office reconnects.
+                if OfficeRules.undecided(ids: self.lastIDs, suspended: self.suspended, offices: self.offices),
+                   self.watcher?.gateways.isEmpty == false { self.checkGateway() } else { self.retryAway() }
             }
         }
         // New network: office check, and routes again (a full tunnel's endpoint route follows the gateway).
@@ -372,7 +376,8 @@ final class TunnelStore: ObservableObject {
                 mac = await Self.gatewayMAC(gateways)
                 if mac != nil { break }
             }
-            if let mac, lastIDs.contains(mac) {
+            // Same network, unless a suspended tunnel still needs an identifier kind (then look up again).
+            if let mac, lastIDs.contains(mac), !OfficeRules.undecided(ids: lastIDs, suspended: suspended, offices: offices) {
                 guard !Task.isCancelled else { return }
                 idsCurrent = true                       // same network as before: still current
                 retryAway()
@@ -384,6 +389,12 @@ final class TunnelStore: ObservableObject {
             // An `up` still running counts as up: it would finish at the office otherwise.
             let up = Array(upInFlight.union(tunnels.filter(\.isUp).map(\.name)))
             var ids = mac.map { [$0] } ?? []
+            // A MAC match is an arrival on its own: off now, not after the lookup below.
+            let byMAC = Set(ids).isDisjoint(with: lastIDs) ? OfficeRules.toDisconnect(ids: ids, offices: offices, up: up) : []
+            if !byMAC.isEmpty {
+                pendingOff = []                         // a new network replaces any wait from the last one
+                for t in tunnels where byMAC.contains(t.name) { officeOff(t) }
+            }
             // Suspended ones too: one paused at an IP-marked office must not come back there on the MAC alone.
             let watched = suspended.union(up)
             let unmatched = watched.subtracting(OfficeRules.toDisconnect(ids: ids, offices: offices, up: Array(watched)))
@@ -396,9 +407,9 @@ final class TunnelStore: ObservableObject {
             lastIDs = isNew ? Set(ids) : lastIDs.union(ids)   // same network: remember its other identifiers too
             idsCurrent = true
             guard isNew else { retryAway(); return }
-            let names = OfficeRules.toDisconnect(ids: ids, offices: offices, up: up)
+            let names = OfficeRules.toDisconnect(ids: ids, offices: offices, up: up).filter { !byMAC.contains($0) }
             let back = OfficeRules.toReconnect(ids: lastIDs, suspended: suspended, offices: offices)
-            pendingOff = []                             // a new network replaces any wait from the last one
+            if byMAC.isEmpty { pendingOff = [] }
             pendingOn = []
             for t in tunnels where names.contains(t.name) { officeOff(t) }
             for n in back { officeOn(n) }

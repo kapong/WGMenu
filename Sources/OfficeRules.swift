@@ -95,12 +95,27 @@ enum OfficeRules {
     }
 
     // Suspended tunnels to bring back up: those whose office list shares nothing with the current
-    // network's identifiers `ids` (left the office, or relaunched elsewhere). No identifiers (no gateway,
-    // no ARP entry, no lookup) -> none: keep waiting. There is no arrival guard, so a relaunch away from
-    // the office restores them.
+    // network's identifiers `ids` (left the office, or relaunched elsewhere), and only when ids has an
+    // identifier of every kind (MAC, public IPv4) the list uses: a MAC alone can't rule out an IP-marked
+    // office, nor the reverse. No identifiers (no gateway, no ARP entry, no lookup) -> none: keep
+    // waiting. No list -> released. There is no arrival guard, so a relaunch away from the office restores them.
     static func toReconnect(ids: Set<String>, suspended: Set<String>, offices: [String: [String]]) -> [String] {
         guard !ids.isEmpty else { return [] }
-        return suspended.filter { offices[$0]?.contains(where: ids.contains) != true }.sorted()
+        let kinds = Set(ids.map(isIPv4))
+        return suspended.filter { n in
+            let l = offices[n] ?? []
+            return !l.contains(where: ids.contains) && Set(l.map(isIPv4)).isSubset(of: kinds)
+        }.sorted()
+    }
+
+    // True if a suspended tunnel is held only because ids lacks a kind its list uses (e.g. the public-IP
+    // lookup failed): the network is worth identifying again.
+    static func undecided(ids: Set<String>, suspended: Set<String>, offices: [String: [String]]) -> Bool {
+        let kinds = Set(ids.map(isIPv4))
+        return suspended.contains { n in
+            let l = offices[n] ?? []
+            return !l.contains(where: ids.contains) && !Set(l.map(isIPv4)).isSubset(of: kinds)
+        }
     }
 
     // Drops suspended names whose tunnel no longer exists, no longer lists any office network, or is up by
