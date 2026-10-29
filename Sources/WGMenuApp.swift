@@ -81,6 +81,10 @@ final class TunnelStore: ObservableObject {
     @Published private(set) var rxHealthy: Set<String> = []  // up tunnels passing Stats.rxHealth
     @Published private(set) var offices = UserDefaults.standard.dictionary(forKey: officeKey) as? [String: [String]] ?? [:]  // tunnel name -> office gateway MACs / public IPs
     @Published private(set) var priority = UserDefaults.standard.stringArray(forKey: priorityKey) ?? []  // tunnel names, highest first
+    // Down because the office rule took them down; back up on leaving the office. Pruned in poll().
+    @Published private(set) var suspended = OfficeRules.loadSuspended() {
+        didSet { OfficeRules.saveSuspended(suspended); if suspended.isEmpty { rejoined = [] } }
+    }
 
     private var refreshTask: Task<Void, Never>?
     private var timer: Timer?
@@ -97,6 +101,10 @@ final class TunnelStore: ObservableObject {
     private var applyAgain = false                      // ... and another was asked for meanwhile
     private var dnsApplied: [String: Bool] = [:]        // tunnels this run brought up -> DNS applied (no nodns)
     private var pendingOff: Set<String> = []            // office auto-off waiting for a busy tunnel
+    private var pendingOn: Set<String> = []             // office reconnect waiting for a busy tunnel
+    private var rejoined: Set<String> = []              // office reconnects done while others are still suspended
+    private var idsCurrent = false                      // lastIDs confirmed by checkGateway since the last network change
+    private var ticks = 0                               // periodic polls; every 6th retries office reconnects
     private var warnedOldHelper = false                 // "helper out of date" shown once, not every poll
     private static let oldHelper = "The helper is out of date. Re-run: sudo wgmenu-setup"
 
@@ -129,10 +137,16 @@ final class TunnelStore: ObservableObject {
             Task { @MainActor in
                 guard let self, self.refreshTask == nil else { return }   // periodic poll: skip if one is running
                 await self.refresh()
+                self.ticks += 1
+                guard self.ticks % 6 == 0 else { return }  // ~30 s
+                // Not fully identified for a suspended tunnel (e.g. lookup failed behind a captive portal):
+                // identify again, unless offline. Else retry failed office reconnects.
+                if OfficeRules.undecided(ids: self.lastIDs, suspended: self.suspended, offices: self.offices),
+                   self.watcher?.gateways.isEmpty == false { self.checkGateway() } else { self.retryAway() }
             }
         }
         // New network: office check, and routes again (a full tunnel's endpoint route follows the gateway).
-        watcher = NetworkWatcher { [weak self] in Task { @MainActor in self?.checkGateway(); self?.applyRoutes() } }
+        watcher = NetworkWatcher { [weak self] in Task { @MainActor in self?.idsCurrent = false; self?.checkGateway(); self?.applyRoutes() } }
         checkGateway()                                  // launching on an office network counts as arrival
         Task { @MainActor in Island.sync(self) }        // after launch finishes: the panel needs NSApp up
     }
@@ -165,6 +179,7 @@ final class TunnelStore: ObservableObject {
                           tx: Int64(f[5]) ?? 0,
                           managed: f.count >= 7 && f[1] == "up" ? f[6] == "managed" : nil)
         }
+        pruneSuspended()
         if !warnedOldHelper, tunnels.contains(where: { $0.isUp && $0.managed == nil }) {
             warnedOldHelper = true
             lastError = Self.oldHelper
@@ -206,14 +221,17 @@ final class TunnelStore: ObservableObject {
     }
 
     // `reconnect`: take the (outside) tunnel down right before the `up`, once the checks passed.
-    private func run(_ name: String, up: Bool, reconnect: Bool = false) {
+    // `office`: an office reconnect, never a modal prompt; it stays suspended (retried later) until it
+    // is up, or a conflict or failed conflict check releases it.
+    private func run(_ name: String, up: Bool, reconnect: Bool = false, office: Bool = false) {
         let action = up ? "up" : "down"
         busy.insert(name)
         if up { upInFlight.insert(name) }
         Task {
+            defer { if up && !office { suspended.remove(name) } }
             var args = [action, name]
             if up {
-                guard let routes = await routesOK(name) else {
+                guard let routes = await routesOK(name, office: office) else {
                     busy.remove(name)
                     upInFlight.remove(name)
                     return
@@ -228,6 +246,7 @@ final class TunnelStore: ObservableObject {
             if reconnect { r = await Helper.runAsync(["down", name]) }
             if r.status == 0 { r = await Helper.runAsync(args) }
             lastError = r.status == 0 ? nil : "\(reconnect ? "Take over" : action) \(name) failed: " + Self.explain(r)
+            if office && r.status == 0 { suspended.remove(name); rejoined.insert(name) }
             await refresh()
             if r.status == 0 {
                 dnsApplied[name] = action == "up" ? !args.contains("nodns") : nil
@@ -241,7 +260,9 @@ final class TunnelStore: ObservableObject {
     // Before every `up`: compare AllowedIPs/DNS with the tunnels already up (read through `wgctl routes`,
     // which prints no keys). Asks every time, Cancel by default; no "don't ask again".
     // Returns the routes read (`name` and the others; empty if they couldn't be read), nil on Cancel.
-    private func routesOK(_ name: String) async -> [String: RouteRules.Routes]? {
+    // An office reconnect never asks: it ignores tunnels suspended or reconnected with it (they ran
+    // together before) and releases it on any other conflict.
+    private func routesOK(_ name: String, office: Bool = false) async -> [String: RouteRules.Routes]? {
         await refresh()
         // Other `up` toggles still running count too: `wgctl routes` reads down tunnels' configs as well.
         var up = tunnels.filter(\.isUp).map(\.name)
@@ -252,15 +273,18 @@ final class TunnelStore: ObservableObject {
         for n in [name] + up {
             let r = await Helper.runAsync(["routes", n])
             guard r.status == 0 else {
+                if office { giveUp(name, "can't check for conflicts — re-run wgmenu-setup."); return nil }
                 NSApp.activate(ignoringOtherApps: true)
                 return Self.confirm("Connect \(name)?", "Can't check for conflicts — re-run wgmenu-setup to update the helper.", ok: "Continue") ? [:] : nil
             }
             routes[n] = RouteRules.parseRoutes(r.out)
         }
         let higher = Set(ordered.map(\.name).prefix(while: { $0 != name }))
-        let issues = RouteRules.conflicts(routes[name]!, with: up.map { ($0, routes[$0]!) }, higher: higher,
+        let others = office ? OfficeRules.othersForRestore(up, coRestored: suspended.union(rejoined)) : up
+        let issues = RouteRules.conflicts(routes[name]!, with: others.map { ($0, routes[$0]!) }, higher: higher,
                                           outside: Set(outside.map(\.name)))
         guard !issues.isEmpty else { return routes }
+        if office { giveUp(name, issues.joined(separator: " ")); return nil }
         NSApp.activate(ignoringOtherApps: true)
         return Self.confirm("\(name) conflicts with a connected tunnel",
                             issues.map { "• " + $0 }.joined(separator: "\n") + "\n\nConnecting may break traffic of either tunnel.",
@@ -336,10 +360,11 @@ final class TunnelStore: ObservableObject {
     }
 
     // Office auto-off: on arrival at a network a tunnel lists (by gateway MAC, or public IP)
-    // while that tunnel is up, take it down once. A network is new only if none of its identifiers
-    // were seen last time, so a manual re-enable there stays up even if the MAC resolves later. The
-    // public IP is only looked up when an up tunnel lists one and the MAC matched nothing.
-    // A newer network change cancels a pending check.
+    // while that tunnel is up, take it down once and mark it suspended. Suspended tunnels whose list
+    // shares nothing with the new network's identifiers come back up (also at launch: lastIDs starts
+    // empty). A network is new only if none of its identifiers were seen last time, so a manual
+    // re-enable there stays up even if the MAC resolves later. The public IP is only looked up when an
+    // up or suspended tunnel the MAC didn't match lists one. A newer network change cancels a pending check.
     private func checkGateway() {
         gatewayTask?.cancel()
         gatewayTask = Task {
@@ -351,41 +376,92 @@ final class TunnelStore: ObservableObject {
                 mac = await Self.gatewayMAC(gateways)
                 if mac != nil { break }
             }
-            if let mac, lastIDs.contains(mac) { return }
+            // Same network, unless a suspended tunnel still needs an identifier kind (then look up again).
+            if let mac, lastIDs.contains(mac), !OfficeRules.undecided(ids: lastIDs, suspended: suspended, offices: offices) {
+                guard !Task.isCancelled else { return }
+                idsCurrent = true                       // same network as before: still current
+                retryAway()
+                return
+            }
             guard mac != nil || OfficeRules.usesPublic(offices) else { return }
             await refresh()                             // decide on fresh up/down state, not a 5 s old poll
             guard !Task.isCancelled else { return }
-            let up = tunnels.filter(\.isUp).map(\.name)
+            // An `up` still running counts as up: it would finish at the office otherwise.
+            let up = Array(upInFlight.union(tunnels.filter(\.isUp).map(\.name)))
             var ids = mac.map { [$0] } ?? []
-            if OfficeRules.toDisconnect(ids: ids, offices: offices, up: up).isEmpty,
-               OfficeRules.usesPublic(offices.filter { up.contains($0.key) }),
+            // A MAC match is an arrival on its own: off now, not after the lookup below.
+            let byMAC = Set(ids).isDisjoint(with: lastIDs) ? OfficeRules.toDisconnect(ids: ids, offices: offices, up: up) : []
+            if !byMAC.isEmpty {
+                pendingOff = []                         // a new network replaces any wait from the last one
+                for t in tunnels where byMAC.contains(t.name) { officeOff(t) }
+            }
+            // Suspended ones too: one paused at an IP-marked office must not come back there on the MAC alone.
+            let watched = suspended.union(up)
+            let unmatched = watched.subtracting(OfficeRules.toDisconnect(ids: ids, offices: offices, up: Array(watched)))
+            if OfficeRules.usesPublic(offices.filter { unmatched.contains($0.key) }),
                let ip = await NetworkWatcher.publicInfo()?.ipv4 {
                 ids.append(ip)
             }
             guard !Task.isCancelled, !ids.isEmpty else { return }
             let isNew = Set(ids).isDisjoint(with: lastIDs)
             lastIDs = isNew ? Set(ids) : lastIDs.union(ids)   // same network: remember its other identifiers too
-            guard isNew else { return }
-            let names = OfficeRules.toDisconnect(ids: ids, offices: offices, up: up)
-            pendingOff = []                             // a new network replaces any wait from the last one
+            idsCurrent = true
+            guard isNew else { retryAway(); return }
+            let names = OfficeRules.toDisconnect(ids: ids, offices: offices, up: up).filter { !byMAC.contains($0) }
+            let back = OfficeRules.toReconnect(ids: lastIDs, suspended: suspended, offices: offices)
+            if byMAC.isEmpty { pendingOff = [] }
+            pendingOn = []
             for t in tunnels where names.contains(t.name) { officeOff(t) }
+            for n in back { officeOn(n) }
         }
     }
 
     // A busy tunnel (e.g. reconnecting to move DNS) is turned off as soon as it is free again.
+    // Suspended as it goes down (busy from here on), so poll() doesn't drop it as up.
     private func officeOff(_ t: Tunnel) {
-        if busy.contains(t.name) { pendingOff.insert(t.name) } else { toggle(t) }   // up, so toggle = down
+        if busy.contains(t.name) { pendingOff.insert(t.name) } else { suspended.insert(t.name); toggle(t) }   // up, so toggle = down
     }
 
-    // Runs when `busy` changes: re-reads status and turns off only tunnels that are still up (never on).
+    // Same wait for a reconnect.
+    private func officeOn(_ name: String) {
+        if busy.contains(name) { pendingOn.insert(name) } else { run(name, up: true, office: true) }
+    }
+
+    // Office reconnects that failed and are still suspended, idle and away from their office: tried
+    // again on a re-confirmed network and every ~30 s. Only on identifiers confirmed since the last
+    // network change, so never on the previous network's.
+    private func retryAway() {
+        guard idsCurrent else { return }
+        for n in OfficeRules.toReconnect(ids: lastIDs, suspended: suspended, offices: offices)
+        where !busy.contains(n) && tunnels.contains(where: { $0.name == n && !$0.isUp }) { officeOn(n) }
+    }
+
+    // A conflict (or no way to check): released as a plain off tunnel, not retried.
+    private func giveUp(_ name: String, _ why: String) {
+        lastError = "\(name) not reconnected: " + why
+        suspended.remove(name)
+    }
+
+    // Runs when `busy` changes: re-reads status, turns off only tunnels that are still up and brings
+    // back only tunnels that are still down, suspended and away on the confirmed network.
     private func retryOfficeOff() {
-        let ready = pendingOff.subtracting(busy)
-        guard !ready.isEmpty else { return }
+        let ready = pendingOff.subtracting(busy), readyOn = pendingOn.subtracting(busy)
+        guard !ready.isEmpty || !readyOn.isEmpty else { return }
         pendingOff.subtract(ready)
+        pendingOn.subtract(readyOn)
         Task {
             await refresh()
             for t in tunnels where ready.contains(t.name) && t.isUp { officeOff(t) }
+            let away = idsCurrent ? OfficeRules.toReconnect(ids: lastIDs, suspended: readyOn, offices: offices) : []
+            for t in tunnels where away.contains(t.name) && !t.isUp && suspended.contains(t.name) { officeOn(t.name) }
         }
+    }
+
+    // After each poll and office-list change (see OfficeRules.pruned).
+    private func pruneSuspended() {
+        let s = OfficeRules.pruned(suspended, existing: tunnels.map(\.name), offices: offices,
+                                   up: tunnels.filter { $0.isUp && !busy.contains($0.name) }.map(\.name))
+        if s != suspended { suspended = s }
     }
 
     // First gateway MAC found: configd's resolved router MAC, else `arp -n` (needs no root). Each IP
@@ -435,7 +511,9 @@ final class TunnelStore: ObservableObject {
                 return
             }
             setOffices(name, OfficeRules.adding(ids, to: offices[name] ?? []))
-            lastIDs = Set(ids)                          // already here: don't treat this network as a new arrival
+            // Already here: don't treat this network as a new arrival. A disjoint id means lastIDs may be
+            // another network's, so office reconnects wait for checkGateway to confirm again.
+            if Set(ids).isDisjoint(with: lastIDs) { lastIDs = Set(ids); idsCurrent = false } else { lastIDs.formUnion(ids) }
             if let pub {
                 NSApp.activate(ignoringOtherApps: true)
                 Self.alert("Office marked by public IP",
@@ -450,6 +528,7 @@ final class TunnelStore: ObservableObject {
     private func setOffices(_ name: String, _ entries: [String]?) {
         offices[name] = entries
         UserDefaults.standard.set(offices, forKey: Self.officeKey)
+        pruneSuspended()
     }
 
     // Swap with the neighbour above (-1) or below (+1).
@@ -737,8 +816,11 @@ struct TunnelRow: View {
         }
     }
 
+    // Taken down by the office rule: grayed out, toggle disabled until leaving the office.
+    private var paused: Bool { !tunnel.isUp && store.suspended.contains(tunnel.name) }
+
     private var detail: String {
-        guard tunnel.isUp else { return "Disconnected" }
+        guard tunnel.isUp else { return paused ? "Paused — office network" : "Disconnected" }
         var parts = [tunnel.iface]
         if let a = handshakeAge {
             parts.append("handshake \(Self.age(a)) ago")
@@ -768,6 +850,7 @@ struct TunnelRow: View {
                 }
                 Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
+            .opacity(paused ? 0.5 : 1)
             Spacer()
             Menu {
                 // Deferred so the menu closes before a password prompt or alert goes modal.
@@ -797,6 +880,9 @@ struct TunnelRow: View {
                                          set: { _ in store.toggle(tunnel) }))
                     .toggleStyle(.switch)
                     .labelsHidden()
+                    .disabled(paused)
+                    .help(paused ? "Paused on the office network: reconnects when you leave it. "
+                                   + "\"Clear office networks\" in the ⋯ menu releases it." : "")
             }
         }
     }

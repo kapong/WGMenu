@@ -79,6 +79,65 @@ enum OfficeCheck {
               "MAC and IP both matched")
         check(OfficeRules.toDisconnect(ids: ["198.51.100.9"], offices: offices, up: ["byip"]).isEmpty, "other IP -> none")
 
+        // Which suspended tunnels to bring back up.
+        let susp: Set<String> = ["work", "lab"]
+        check(OfficeRules.toReconnect(ids: [home], suspended: susp, offices: offices) == ["lab", "work"],
+              "left the office -> all suspended come back (sorted)")
+        check(OfficeRules.toReconnect(ids: [office], suspended: susp, offices: offices).isEmpty, "still in office -> none")
+        check(OfficeRules.toReconnect(ids: [], suspended: susp, offices: offices).isEmpty, "no identifiers -> none")
+        check(OfficeRules.toReconnect(ids: [home], suspended: [], offices: offices).isEmpty, "nothing suspended -> none")
+        check(OfficeRules.toReconnect(ids: [office], suspended: ["work", "other"], offices: offices) == ["other"],
+              "per-tunnel: only tunnels not listing this network")
+        check(OfficeRules.toReconnect(ids: [office], suspended: ["gone"], offices: offices) == ["gone"],
+              "no office list -> nothing holds it down")
+        check(OfficeRules.toReconnect(ids: [office, ip], suspended: ["byip", "lab"], offices: offices).isEmpty,
+              "IP-marked office: MAC and looked-up IP -> stays paused")
+        check(OfficeRules.toReconnect(ids: [office], suspended: ["byip"], offices: offices).isEmpty,
+              "MAC alone can't rule out an IP-marked office -> held (the lookup covers suspended tunnels)")
+        check(OfficeRules.toReconnect(ids: [home, "198.51.100.9"], suspended: ["byip", "lab"], offices: offices) == ["byip", "lab"],
+              "other MAC and IP -> left the office")
+        // Partial identification: a missing kind holds the tunnel.
+        check(OfficeRules.toReconnect(ids: [home], suspended: ["byip"], offices: offices).isEmpty,
+              "MAC-only ids vs IP-marked tunnel -> held")
+        check(OfficeRules.toReconnect(ids: ["198.51.100.9"], suspended: ["lab"], offices: offices).isEmpty,
+              "IP-only ids vs MAC-marked tunnel -> held")
+        check(OfficeRules.toReconnect(ids: [home, "198.51.100.9"], suspended: ["byip", "lab"], offices: offices) == ["byip", "lab"],
+              "both kinds present, none matching -> released")
+        let mixed = ["mix": [office, ip]]
+        check(OfficeRules.toReconnect(ids: [home], suspended: ["mix"], offices: mixed).isEmpty, "mixed list, IP kind missing -> held")
+        check(OfficeRules.toReconnect(ids: ["198.51.100.9"], suspended: ["mix"], offices: mixed).isEmpty, "mixed list, MAC kind missing -> held")
+        check(OfficeRules.toReconnect(ids: [office], suspended: ["mix"], offices: mixed).isEmpty, "mixed list, MAC matches -> held")
+        check(OfficeRules.undecided(ids: [home], suspended: ["byip"], offices: offices), "held for a missing kind -> undecided")
+        check(!OfficeRules.undecided(ids: [office], suspended: ["mix"], offices: mixed), "matched -> decided")
+        check(!OfficeRules.undecided(ids: [home], suspended: ["lab"], offices: offices), "all kinds present -> decided")
+        check(OfficeRules.undecided(ids: [], suspended: ["lab"], offices: offices), "nothing identified -> undecided")
+        check(!OfficeRules.undecided(ids: [], suspended: [], offices: offices), "nothing suspended -> decided")
+
+        // Pruning stale persisted entries.
+        let offs = ["work": [office], "lab": [String]()]
+        check(OfficeRules.pruned(["work", "lab", "gone", "bare"], existing: ["work", "lab", "bare"], offices: offs, up: []) == ["work"],
+              "drops missing tunnels and ones without office networks")
+        check(OfficeRules.pruned([], existing: ["work"], offices: offs, up: []).isEmpty, "empty stays empty")
+        check(OfficeRules.pruned(["work"], existing: ["work"], offices: offs, up: ["work"]).isEmpty, "up and not busy -> dropped")
+        check(OfficeRules.pruned(["work"], existing: ["work"], offices: offs, up: []) == ["work"],
+              "up and busy (not in up) -> kept")
+        check(OfficeRules.pruned(["work"], existing: ["work"], offices: offs, up: ["lab"]) == ["work"], "down -> kept")
+
+        // Office reconnect conflicts ignore tunnels suspended or reconnected with it.
+        check(OfficeRules.othersForRestore(["lab", "work", "x"], coRestored: ["lab", "work"]) == ["x"],
+              "co-restored names are not conflict candidates")
+
+        // Persistence round trip (throwaway suite).
+        let suite = "wgmenu.officecheck.\(getpid())"
+        let d = UserDefaults(suiteName: suite)!
+        check(OfficeRules.loadSuspended(d).isEmpty, "nothing stored -> empty")
+        OfficeRules.saveSuspended(["work", "lab"], d)
+        check(d.stringArray(forKey: "suspendedByOffice") == ["lab", "work"], "stored as sorted string array")
+        check(OfficeRules.loadSuspended(d) == ["work", "lab"], "round trip")
+        OfficeRules.saveSuspended([], d)
+        check(OfficeRules.loadSuspended(d).isEmpty, "cleared")
+        d.removePersistentDomain(forName: suite)
+
         print("OfficeCheck: all passed")
     }
 }

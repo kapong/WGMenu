@@ -3,7 +3,8 @@ import Foundation
 // Pure rules for "office network" auto-off: a tunnel lists the networks where it should go down on
 // arrival. Entries are strings, classified by shape: the MAC of the default gateway (first-hop
 // router) or, when that couldn't be read, the network's public IPv4. Hostname and ASN are shown, never
-// matched (ASN covers a whole ISP). No UI, no I/O; see tests/OfficeCheck.swift.
+// matched (ASN covers a whole ISP). The office rule's down tunnels are "suspended" and come back up on
+// leaving. No UI; only I/O is the suspended set in UserDefaults. See tests/OfficeCheck.swift.
 enum OfficeRules {
     // Lowercase, zero-padded "aa:bb:cc:dd:ee:ff", or nil. arp prints octets unpadded ("0:1b:...").
     static func normalizeMAC(_ s: String) -> String? {
@@ -91,5 +92,52 @@ enum OfficeRules {
     // decides whether this is an arrival.
     static func toDisconnect(ids: [String], offices: [String: [String]], up: [String]) -> [String] {
         up.filter { offices[$0]?.contains(where: ids.contains) == true }
+    }
+
+    // Suspended tunnels to bring back up: those whose office list shares nothing with the current
+    // network's identifiers `ids` (left the office, or relaunched elsewhere), and only when ids has an
+    // identifier of every kind (MAC, public IPv4) the list uses: a MAC alone can't rule out an IP-marked
+    // office, nor the reverse. No identifiers (no gateway, no ARP entry, no lookup) -> none: keep
+    // waiting. No list -> released. There is no arrival guard, so a relaunch away from the office restores them.
+    static func toReconnect(ids: Set<String>, suspended: Set<String>, offices: [String: [String]]) -> [String] {
+        guard !ids.isEmpty else { return [] }
+        let kinds = Set(ids.map(isIPv4))
+        return suspended.filter { n in
+            let l = offices[n] ?? []
+            return !l.contains(where: ids.contains) && Set(l.map(isIPv4)).isSubset(of: kinds)
+        }.sorted()
+    }
+
+    // True if a suspended tunnel is held only because ids lacks a kind its list uses (e.g. the public-IP
+    // lookup failed): the network is worth identifying again.
+    static func undecided(ids: Set<String>, suspended: Set<String>, offices: [String: [String]]) -> Bool {
+        let kinds = Set(ids.map(isIPv4))
+        return suspended.contains { n in
+            let l = offices[n] ?? []
+            return !l.contains(where: ids.contains) && !Set(l.map(isIPv4)).isSubset(of: kinds)
+        }
+    }
+
+    // Drops suspended names whose tunnel no longer exists, no longer lists any office network, or is up by
+    // other means (`up`: names up and not busy). Busy ones may be going down for the office rule, down ones wait.
+    static func pruned(_ suspended: Set<String>, existing: [String], offices: [String: [String]], up: [String]) -> Set<String> {
+        suspended.filter { existing.contains($0) && offices[$0]?.isEmpty == false && !up.contains($0) }
+    }
+
+    // Conflict candidates for an office reconnect: tunnels up or coming up, minus those suspended or
+    // reconnected with it, which ran together with it before the office took them down.
+    static func othersForRestore(_ others: [String], coRestored: Set<String>) -> [String] {
+        others.filter { !coRestored.contains($0) }
+    }
+
+    // Persisted as a string array so the suspended set survives a quit or relaunch.
+    static let suspendedKey = "suspendedByOffice"
+
+    static func loadSuspended(_ d: UserDefaults = .standard) -> Set<String> {
+        Set(d.stringArray(forKey: suspendedKey) ?? [])
+    }
+
+    static func saveSuspended(_ s: Set<String>, _ d: UserDefaults = .standard) {
+        d.set(s.sorted(), forKey: suspendedKey)
     }
 }
