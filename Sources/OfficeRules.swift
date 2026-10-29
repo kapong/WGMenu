@@ -1,8 +1,10 @@
 import Foundation
 
-// Pure rules for "office network" auto-off: a tunnel lists the MACs of default gateways
-// (first-hop routers) where it should go down on arrival; the office rule's down tunnels are "suspended"
-// and come back up on leaving. No UI; only I/O is the suspended set in UserDefaults. See tests/OfficeCheck.swift.
+// Pure rules for "office network" auto-off: a tunnel lists the networks where it should go down on
+// arrival. Entries are strings, classified by shape: the MAC of the default gateway (first-hop
+// router) or, when that couldn't be read, the network's public IPv4. Hostname and ASN are shown, never
+// matched (ASN covers a whole ISP). The office rule's down tunnels are "suspended" and come back up on
+// leaving. No UI; only I/O is the suspended set in UserDefaults. See tests/OfficeCheck.swift.
 enum OfficeRules {
     // Lowercase, zero-padded "aa:bb:cc:dd:ee:ff", or nil. arp prints octets unpadded ("0:1b:...").
     static func normalizeMAC(_ s: String) -> String? {
@@ -36,27 +38,72 @@ enum OfficeRules {
         }
     }
 
-    // Adds mac to a tunnel's list, deduplicated; the list keeps insertion order.
-    static func adding(_ mac: String, to list: [String]) -> [String] {
-        list.contains(mac) ? list : list + [mac]
+    // The network as a what's-my-IP service sees it. Only the IPv4 is a match key; hostname and
+    // ASN are for display.
+    struct Public: Decodable, Equatable {
+        var ip: String?
+        var hostname: String?
+        var asn: String?
+        var asnOrg: String?
+        enum CodingKeys: String, CodingKey { case ip, hostname, asn, asnOrg = "asn_org" }
+
+        // The stored entry: IPv4 only (IPv6 privacy addresses change per device).
+        var ipv4: String? { ip.flatMap { isIPv4($0) ? $0 : nil } }
+
+        // "203.0.113.5 (AS64500 Example ISP) / office-1.example.net".
+        var label: String {
+            let who = [asn, asnOrg].compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " ")
+            var out = ip ?? "unknown"
+            if !who.isEmpty { out += " (\(who))" }
+            if let h = hostname, !h.isEmpty, h != ip { out += " / " + h }
+            return out
+        }
     }
 
-    // Tunnels to take down: only on arrival (gateway MAC differs from the last one seen), and only
-    // up tunnels that list it. Same MAC again (a manual re-enable in the office) or no MAC -> none.
-    static func toDisconnect(mac: String?, lastMAC: String?, offices: [String: [String]], up: [String]) -> [String] {
-        guard let mac, mac != lastMAC else { return [] }
-        return up.filter { offices[$0]?.contains(mac) == true }
+    // Body of a raw HTTP/1.x response with status 200, else nil.
+    static func httpBody(_ response: String) -> String? {
+        guard let split = response.range(of: "\r\n\r\n"),
+              response[..<split.lowerBound].split(separator: " ", maxSplits: 2).dropFirst().first == "200" else { return nil }
+        return String(response[split.upperBound...])
     }
 
-    // Suspended tunnels to bring back up: those whose office list no longer contains the gateway MAC
-    // (left the office, or relaunched elsewhere). No MAC (no gateway / no ARP entry) -> none: keep waiting.
-    // Unlike toDisconnect there is no lastMAC guard, so a relaunch away from the office restores them.
-    static func toReconnect(mac: String?, suspended: Set<String>, offices: [String: [String]]) -> [String] {
-        guard let mac else { return [] }
-        return suspended.filter { offices[$0]?.contains(mac) != true }.sorted()
+    // ifconfig.co/json body. Missing fields are fine; nil if it is not JSON.
+    static func publicFromJSON(_ body: String) -> Public? {
+        try? JSONDecoder().decode(Public.self, from: Data(body.utf8))
     }
 
-    // Drops suspended names whose tunnel no longer exists, no longer lists any office MAC, or is up by
+    // api.ipify.org body: the IPv4 alone.
+    static func publicFromPlain(_ body: String) -> Public? {
+        let ip = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isIPv4(ip) ? Public(ip: ip) : nil
+    }
+
+    // Adds entries (a MAC or a public IP) to a tunnel's list, deduplicated, in insertion order.
+    static func adding(_ entries: [String], to list: [String]) -> [String] {
+        entries.reduce(list) { $0.contains($1) ? $0 : $0 + [$1] }
+    }
+
+    // True if any tunnel lists a network by public IP (so a lookup is worth a request).
+    static func usesPublic(_ offices: [String: [String]]) -> Bool {
+        offices.values.contains { $0.contains(where: isIPv4) }
+    }
+
+    // Up tunnels listing any of the network's identifiers `ids` (gateway MAC, public IP). The caller
+    // decides whether this is an arrival.
+    static func toDisconnect(ids: [String], offices: [String: [String]], up: [String]) -> [String] {
+        up.filter { offices[$0]?.contains(where: ids.contains) == true }
+    }
+
+    // Suspended tunnels to bring back up: those whose office list shares nothing with the current
+    // network's identifiers `ids` (left the office, or relaunched elsewhere). No identifiers (no gateway,
+    // no ARP entry, no lookup) -> none: keep waiting. There is no arrival guard, so a relaunch away from
+    // the office restores them.
+    static func toReconnect(ids: Set<String>, suspended: Set<String>, offices: [String: [String]]) -> [String] {
+        guard !ids.isEmpty else { return [] }
+        return suspended.filter { offices[$0]?.contains(where: ids.contains) != true }.sorted()
+    }
+
+    // Drops suspended names whose tunnel no longer exists, no longer lists any office network, or is up by
     // other means (`up`: names up and not busy). Busy ones may be going down for the office rule, down ones wait.
     static func pruned(_ suspended: Set<String>, existing: [String], offices: [String: [String]], up: [String]) -> Set<String> {
         suspended.filter { existing.contains($0) && offices[$0]?.isEmpty == false && !up.contains($0) }
