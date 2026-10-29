@@ -59,6 +59,43 @@ enum OfficeCheck {
         check(OfficeRules.toDisconnect(mac: office, lastMAC: home, offices: offices, up: []).isEmpty, "nothing up -> none")
         check(OfficeRules.toDisconnect(mac: office, lastMAC: home, offices: [:], up: ["work"]).isEmpty, "no rules -> none")
 
+        // Which suspended tunnels to bring back up.
+        let susp: Set<String> = ["work", "lab"]
+        check(OfficeRules.toReconnect(mac: home, suspended: susp, offices: offices) == ["lab", "work"],
+              "left the office -> all suspended come back (sorted)")
+        check(OfficeRules.toReconnect(mac: office, suspended: susp, offices: offices).isEmpty, "still in office -> none")
+        check(OfficeRules.toReconnect(mac: nil, suspended: susp, offices: offices).isEmpty, "no gateway -> none")
+        check(OfficeRules.toReconnect(mac: home, suspended: [], offices: offices).isEmpty, "nothing suspended -> none")
+        check(OfficeRules.toReconnect(mac: office, suspended: ["work", "other"], offices: offices) == ["other"],
+              "per-tunnel: only tunnels not listing this MAC")
+        check(OfficeRules.toReconnect(mac: office, suspended: ["gone"], offices: offices) == ["gone"],
+              "no office list -> nothing holds it down")
+
+        // Pruning stale persisted entries.
+        let offs = ["work": [office], "lab": [String]()]
+        check(OfficeRules.pruned(["work", "lab", "gone", "bare"], existing: ["work", "lab", "bare"], offices: offs, up: []) == ["work"],
+              "drops missing tunnels and ones without office MACs")
+        check(OfficeRules.pruned([], existing: ["work"], offices: offs, up: []).isEmpty, "empty stays empty")
+        check(OfficeRules.pruned(["work"], existing: ["work"], offices: offs, up: ["work"]).isEmpty, "up and not busy -> dropped")
+        check(OfficeRules.pruned(["work"], existing: ["work"], offices: offs, up: []) == ["work"],
+              "up and busy (not in up) -> kept")
+        check(OfficeRules.pruned(["work"], existing: ["work"], offices: offs, up: ["lab"]) == ["work"], "down -> kept")
+
+        // Office reconnect conflicts ignore tunnels suspended or reconnected with it.
+        check(OfficeRules.othersForRestore(["lab", "work", "x"], coRestored: ["lab", "work"]) == ["x"],
+              "co-restored names are not conflict candidates")
+
+        // Persistence round trip (throwaway suite).
+        let suite = "wgmenu.officecheck.\(getpid())"
+        let d = UserDefaults(suiteName: suite)!
+        check(OfficeRules.loadSuspended(d).isEmpty, "nothing stored -> empty")
+        OfficeRules.saveSuspended(["work", "lab"], d)
+        check(d.stringArray(forKey: "suspendedByOffice") == ["lab", "work"], "stored as sorted string array")
+        check(OfficeRules.loadSuspended(d) == ["work", "lab"], "round trip")
+        OfficeRules.saveSuspended([], d)
+        check(OfficeRules.loadSuspended(d).isEmpty, "cleared")
+        d.removePersistentDomain(forName: suite)
+
         print("OfficeCheck: all passed")
     }
 }
